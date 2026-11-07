@@ -27,6 +27,23 @@ pub struct Node {
     pub y: f32,
     /// Compass-style on the plan: 0° = up the page, clockwise.
     pub facing_deg: f32,
+    /// Speakers only: play on just this output channel (0 = left, 1 = right, …).
+    /// None = all channels, e.g. a soundbar used as one speaker.
+    #[serde(default)]
+    pub channel: Option<u8>,
+}
+
+pub fn channel_name(c: Option<u8>) -> String {
+    match c {
+        None => "all channels".into(),
+        Some(0) => "left (ch 1)".into(),
+        Some(1) => "right (ch 2)".into(),
+        Some(2) => "centre (ch 3)".into(),
+        Some(3) => "sub (ch 4)".into(),
+        Some(4) => "rear left (ch 5)".into(),
+        Some(5) => "rear right (ch 6)".into(),
+        Some(n) => format!("ch {}", n + 1),
+    }
 }
 
 impl Node {
@@ -55,8 +72,8 @@ impl Layout {
             width_m: 3.5,
             depth_m: 3.0,
             nodes: vec![
-                Node { kind: Kind::Speaker, label: "S1".into(), device: "default".into(), x: 1.75, y: 2.6, facing_deg: 180.0 },
-                Node { kind: Kind::Mic, label: "M1".into(), device: "default".into(), x: 2.05, y: 2.6, facing_deg: 180.0 },
+                Node { kind: Kind::Speaker, label: "S1".into(), device: "default".into(), x: 1.75, y: 2.6, facing_deg: 180.0, channel: None },
+                Node { kind: Kind::Mic, label: "M1".into(), device: "default".into(), x: 2.05, y: 2.6, facing_deg: 180.0, channel: None },
             ],
         }
     }
@@ -144,7 +161,7 @@ mod tests {
     fn labels_and_clamping() {
         let mut l = Layout::starter();
         assert_eq!(l.next_label(Kind::Mic), "M2");
-        l.nodes.push(Node { kind: Kind::Mic, label: "M2".into(), device: "default".into(), x: 9.0, y: -1.0, facing_deg: 370.0 });
+        l.nodes.push(Node { kind: Kind::Mic, label: "M2".into(), device: "default".into(), x: 9.0, y: -1.0, facing_deg: 370.0, channel: None });
         l.clamp();
         assert_eq!((l.nodes[2].x, l.nodes[2].y), (3.5, 0.0));
         assert!((l.nodes[2].facing_deg - 10.0).abs() < 1e-3);

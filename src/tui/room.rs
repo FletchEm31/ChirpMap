@@ -173,7 +173,8 @@ fn device_choices() -> (Vec<String>, Vec<String>) {
         use cpal::traits::{DeviceTrait, HostTrait};
         let pick = |names: Vec<String>| {
             let mut v = vec!["default".to_string()];
-            v.extend(names.into_iter().filter(|n| n.starts_with("sysdefault:CARD=")));
+            // One entry per card (+ HDMI outputs, where AV receivers usually live).
+            v.extend(names.into_iter().filter(|n| n.starts_with("sysdefault:CARD=") || n.starts_with("hdmi:CARD=")));
             v
         };
         let outs = host.output_devices().map(|d| d.filter_map(|x| x.name().ok()).collect()).unwrap_or_default();
@@ -197,6 +198,7 @@ impl Designer {
             x: self.l.width_m / 2.0,
             y: self.l.depth_m / 2.0,
             facing_deg: 0.0,
+            channel: None,
         });
         self.sel = self.l.nodes.len() - 1;
     }
@@ -225,6 +227,14 @@ impl Designer {
                 self.l.nodes.remove(self.sel);
                 self.l.relabel();
                 self.sel = self.sel.min(self.l.nodes.len().saturating_sub(1));
+            }
+            KeyCode::Char('c') if n > 0 && self.l.nodes[self.sel].kind == Kind::Speaker => {
+                let node = &mut self.l.nodes[self.sel];
+                node.channel = match node.channel {
+                    None => Some(0),
+                    Some(c) if c < 5 => Some(c + 1),
+                    _ => None,
+                };
             }
             KeyCode::Char('w') => self.l.width_m -= 0.10,
             KeyCode::Char('W') => self.l.width_m += 0.10,
@@ -289,6 +299,9 @@ pub(super) fn draw_designer(f: &mut Frame, left: Rect, right: Rect, d: &Designer
             }
         }
         lines.push(Line::from(Span::styled(format!("    device: {}", n.device), Style::new().fg(DIM))));
+        if n.kind == Kind::Speaker {
+            lines.push(Line::from(Span::styled(format!("    plays on: {}", plan::channel_name(n.channel)), Style::new().fg(DIM))));
+        }
     }
     lines.push(Line::raw(""));
     let sp = d.l.speakers().len();
@@ -300,6 +313,7 @@ pub(super) fn draw_designer(f: &mut Frame, left: Rect, right: Rect, d: &Designer
         ("arrows", "move 5 cm (Shift: 30 cm)"),
         ("[ ]", "turn 45°"),
         ("n", "which physical device"),
+        ("c", "speaker channel (L/R/all)"),
         ("a / m", "add speaker / mic"),
         ("x", "delete"),
         ("w W d D", "room width/depth ±10 cm"),

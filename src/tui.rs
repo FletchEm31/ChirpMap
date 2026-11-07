@@ -463,7 +463,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let keys = match app.mode {
         Mode::Live(_) => " Esc/q back to menu · r re-capture background · Ctrl+C back ",
         Mode::AskLevels { .. } => " y use levels · n keep yours · Esc cancel ",
-        Mode::Designer(_) => " Tab device · arrows move · [ ] turn · n device · a/m add · x delete · Enter save · Esc cancel ",
+        Mode::Designer(_) => " Tab device · arrows move · [ ] turn · n device · c channel · a/m add · x delete · Enter save · Esc cancel ",
         Mode::Array(_) => " Esc/q back · r re-capture empty room · t tracker ⇄ every reflector ",
         Mode::Menu => " ↑↓ select · Enter run · 1-8 jump · q quit ",
     };

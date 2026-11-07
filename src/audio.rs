@@ -269,7 +269,8 @@ where
     }
 }
 
-fn fill<T>(out: &mut [T], ch: usize, play: &[f32], pos: &AtomicUsize)
+/// `only`: play on that one channel (e.g. just the left tower) and keep the rest silent.
+fn fill<T>(out: &mut [T], ch: usize, only: Option<usize>, play: &[f32], pos: &AtomicUsize)
 where
     T: Sample + FromSample<f32>,
 {
@@ -277,8 +278,8 @@ where
     for f in out.chunks_mut(ch) {
         let v = play.get(p).copied().unwrap_or(0.0);
         p += 1;
-        for s in f.iter_mut() {
-            *s = T::from_sample(v);
+        for (c, s) in f.iter_mut().enumerate() {
+            *s = T::from_sample(if only.map_or(true, |o| o == c) { v } else { 0.0 });
         }
     }
     pos.store(p, Ordering::Relaxed);
@@ -314,25 +315,26 @@ pub(crate) fn build_output(
     fmt: SampleFormat,
     play: Arc<Vec<f32>>,
     pos: Arc<AtomicUsize>,
+    only: Option<usize>,
 ) -> Result<Stream> {
     let ch = cfg.channels as usize;
-    fn mk<T>(dev: &Device, cfg: &StreamConfig, play: Arc<Vec<f32>>, pos: Arc<AtomicUsize>, ch: usize) -> Result<Stream>
+    fn mk<T>(dev: &Device, cfg: &StreamConfig, play: Arc<Vec<f32>>, pos: Arc<AtomicUsize>, ch: usize, only: Option<usize>) -> Result<Stream>
     where
         T: SizedSample + FromSample<f32>,
     {
         Ok(dev.build_output_stream(
             cfg,
-            move |d: &mut [T], _: &cpal::OutputCallbackInfo| fill(d, ch, &play, &pos),
+            move |d: &mut [T], _: &cpal::OutputCallbackInfo| fill(d, ch, only, &play, &pos),
             err_fn,
             None,
         )?)
     }
     match fmt {
-        SampleFormat::F32 => mk::<f32>(dev, cfg, play, pos, ch),
-        SampleFormat::I16 => mk::<i16>(dev, cfg, play, pos, ch),
-        SampleFormat::U16 => mk::<u16>(dev, cfg, play, pos, ch),
-        SampleFormat::I32 => mk::<i32>(dev, cfg, play, pos, ch),
-        SampleFormat::U8 => mk::<u8>(dev, cfg, play, pos, ch),
+        SampleFormat::F32 => mk::<f32>(dev, cfg, play, pos, ch, only),
+        SampleFormat::I16 => mk::<i16>(dev, cfg, play, pos, ch, only),
+        SampleFormat::U16 => mk::<u16>(dev, cfg, play, pos, ch, only),
+        SampleFormat::I32 => mk::<i32>(dev, cfg, play, pos, ch, only),
+        SampleFormat::U8 => mk::<u8>(dev, cfg, play, pos, ch, only),
         f => bail!("unsupported speaker sample format {f:?}"),
     }
 }
@@ -369,6 +371,7 @@ impl Sonar for CpalSonar {
                 self.out_fmt,
                 Arc::new(play),
                 Arc::new(AtomicUsize::new(0)),
+                None,
             )?;
             s.play()?;
             Ok(s)
@@ -602,4 +605,21 @@ fn hardware_panel_inner() -> Result<String> {
         );
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_channel_output_keeps_other_channels_silent() {
+        let play = vec![0.5f32, -0.25];
+        let pos = AtomicUsize::new(0);
+        let mut out = vec![9.0f32; 4]; // 2 frames × 2 channels (L, R)
+        fill(&mut out, 2, Some(1), &play, &pos); // right tower only
+        assert_eq!(out, vec![0.0, 0.5, 0.0, -0.25]);
+        let pos = AtomicUsize::new(0);
+        fill(&mut out, 2, None, &play, &pos); // all channels
+        assert_eq!(out, vec![0.5, 0.5, -0.25, -0.25]);
+    }
 }

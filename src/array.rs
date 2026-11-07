@@ -40,6 +40,8 @@ struct Port {
     cfg: StreamConfig,
     fmt: SampleFormat,
     rate: u32,
+    /// Speakers: play on just this channel (None = all).
+    only: Option<usize>,
 }
 
 pub struct CpalArray {
@@ -67,7 +69,13 @@ impl CpalArray {
             let dev = select(host.output_devices()?.collect(), host.default_output_device(), sel(&n.device), "output")
                 .with_context(|| format!("{}: speaker '{}'", n.label, n.device))?;
             let c = dev.default_output_config()?;
-            outs.push(Port { rate: c.sample_rate().0, fmt: c.sample_format(), cfg: c.into(), dev });
+            let only = n.channel.map(|c| c as usize);
+            if let Some(ch) = only {
+                if ch >= c.channels() as usize {
+                    bail!("{}: '{}' has {} channel(s), no channel {}", n.label, n.device, c.channels(), ch + 1);
+                }
+            }
+            outs.push(Port { rate: c.sample_rate().0, fmt: c.sample_format(), cfg: c.into(), dev, only });
         }
         let fs = outs[0].rate;
         let mut ins = Vec::new();
@@ -75,7 +83,7 @@ impl CpalArray {
             let dev = select(host.input_devices()?.collect(), host.default_input_device(), sel(&n.device), "input")
                 .with_context(|| format!("{}: mic '{}'", n.label, n.device))?;
             let c = dev.default_input_config()?;
-            let mut p = Port { rate: c.sample_rate().0, fmt: c.sample_format(), cfg: c.into(), dev };
+            let mut p = Port { rate: c.sample_rate().0, fmt: c.sample_format(), cfg: c.into(), dev, only: None };
             if p.rate != fs {
                 if let Ok(ranges) = p.dev.supported_input_configs() {
                     if let Some(r) = ranges
@@ -126,7 +134,7 @@ impl ArrayIo for CpalArray {
         play.extend(std::iter::repeat(0.0).take((listen_s * r) as usize));
         let dur = play.len() as f32 / r + 0.3;
         let outs = quiet(|| -> Result<Stream> {
-            let s = build_output(&out.dev, &out.cfg, out.fmt, Arc::new(play), Arc::new(AtomicUsize::new(0)))?;
+            let s = build_output(&out.dev, &out.cfg, out.fmt, Arc::new(play), Arc::new(AtomicUsize::new(0)), out.only)?;
             s.play()?;
             Ok(s)
         })?;
@@ -425,10 +433,10 @@ mod tests {
         l.width_m = 4.0;
         l.depth_m = 3.5;
         l.nodes = vec![
-            Node { kind: Kind::Speaker, label: "S1".into(), device: "default".into(), x: 0.6, y: 3.2, facing_deg: 180.0 },
-            Node { kind: Kind::Speaker, label: "S2".into(), device: "default".into(), x: 3.4, y: 3.2, facing_deg: 180.0 },
-            Node { kind: Kind::Mic, label: "M1".into(), device: "default".into(), x: 1.4, y: 3.3, facing_deg: 180.0 },
-            Node { kind: Kind::Mic, label: "M2".into(), device: "default".into(), x: 2.6, y: 0.3, facing_deg: 0.0 },
+            Node { kind: Kind::Speaker, label: "S1".into(), device: "default".into(), x: 0.6, y: 3.2, facing_deg: 180.0, channel: None },
+            Node { kind: Kind::Speaker, label: "S2".into(), device: "default".into(), x: 3.4, y: 3.2, facing_deg: 180.0, channel: None },
+            Node { kind: Kind::Mic, label: "M1".into(), device: "default".into(), x: 1.4, y: 3.3, facing_deg: 180.0, channel: None },
+            Node { kind: Kind::Mic, label: "M2".into(), device: "default".into(), x: 2.6, y: 0.3, facing_deg: 0.0, channel: None },
         ];
         l
     }

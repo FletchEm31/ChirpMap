@@ -172,7 +172,7 @@ pub fn dev_name(d: &Device) -> String {
     d.name().unwrap_or_else(|_| "<unnamed>".into())
 }
 
-fn select(devs: Vec<Device>, default: Option<Device>, sel: Option<&str>, kind: &str) -> Result<Device> {
+pub(crate) fn select(devs: Vec<Device>, default: Option<Device>, sel: Option<&str>, kind: &str) -> Result<Device> {
     match sel {
         None => default.ok_or_else(|| anyhow!("no default {kind} device found")),
         Some(s) => {
@@ -284,7 +284,7 @@ where
     pos.store(p, Ordering::Relaxed);
 }
 
-fn build_input(dev: &Device, cfg: &StreamConfig, fmt: SampleFormat, buf: Arc<Mutex<Vec<f32>>>) -> Result<Stream> {
+pub(crate) fn build_input(dev: &Device, cfg: &StreamConfig, fmt: SampleFormat, buf: Arc<Mutex<Vec<f32>>>) -> Result<Stream> {
     let ch = cfg.channels as usize;
     fn mk<T>(dev: &Device, cfg: &StreamConfig, buf: Arc<Mutex<Vec<f32>>>, ch: usize) -> Result<Stream>
     where
@@ -308,7 +308,7 @@ fn build_input(dev: &Device, cfg: &StreamConfig, fmt: SampleFormat, buf: Arc<Mut
     }
 }
 
-fn build_output(
+pub(crate) fn build_output(
     dev: &Device,
     cfg: &StreamConfig,
     fmt: SampleFormat,

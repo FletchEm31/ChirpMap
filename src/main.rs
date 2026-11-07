@@ -1,9 +1,11 @@
 //! ChirpMap — terminal-native acoustic echolocation that maps rooms like an
 //! architect's blueprint, using any speaker and mic. Fully offline.
 
+mod array;
 mod audio;
 mod calib;
 mod dsp;
+mod layout;
 mod levels;
 mod map;
 mod render;

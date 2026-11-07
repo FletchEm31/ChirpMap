@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod room;
+
 // Blueprint palette.
 // Brand: board B, "Blueprint + sonar mark".
 const NAVY: Color = Color::Rgb(0x0D, 0x3B, 0x66); // blueprint paper
@@ -53,6 +55,10 @@ const ITEMS: &[Item] = &[
         help: "Every speaker and microphone the system exposes, what they can do, and which ones are calibrated." },
     Item { key: '6', name: "Simulator demo", blurb: "fake room, no hardware",
         help: "Scans a simulated 5.2 × 4.1 m room (17' × 13'). Shows what a finished map looks like without making a sound." },
+    Item { key: '7', name: "Room designer", blurb: "draw room + devices",
+        help: "Draw your room to scale and place every speaker and microphone: where it sits, which way it faces, and which physical device it is. ChirpMap uses this geometry to turn echoes into positions." },
+    Item { key: '8', name: "Array tracker", blurb: "2D, all pairs",
+        help: "Uses every speaker → mic pair in your room layout at once and shows where things are ON THE FLOOR PLAN as a heat map. More speakers and mics = more pairs = a sharper fix." },
     Item { key: 'u', name: "Update", blurb: "git pull + reinstall",
         help: "Pulls the latest ChirpMap from GitHub into the folder it was built from and reinstalls it. Restart chirpmap afterwards." },
     Item { key: 'q', name: "Quit", blurb: "", help: "Leave ChirpMap. Any audio levels it changed are already put back." },
@@ -90,6 +96,8 @@ enum Mode {
     Menu,
     AskLevels { diff: bool, spk: u32, mic: u32 },
     Live(Live),
+    Designer(room::Designer),
+    Array(room::ArrayView),
 }
 
 struct App {
@@ -100,6 +108,8 @@ struct App {
     calib: (String, bool),
     mode: Mode,
     quit: bool,
+    /// One-line message shown in the footer (e.g. "Saved room …").
+    note: Option<String>,
 }
 
 impl App {
@@ -112,6 +122,7 @@ impl App {
             calib: (String::new(), false),
             mode: Mode::Menu,
             quit: false,
+            note: None,
         };
         a.state.select(Some(0));
         a.refresh();
@@ -275,6 +286,11 @@ fn activate(app: &mut App, terminal: &mut DefaultTerminal, key: char) {
             app.quit = true;
             *terminal = ratatui::init();
         }
+        '7' => app.mode = Mode::Designer(room::Designer::new()),
+        '8' => match room::ArrayView::start(true) {
+            Ok(v) => app.mode = Mode::Array(v),
+            Err(e) => app.note = Some(e),
+        },
         'q' => app.quit = true,
         _ => {}
     }
@@ -303,6 +319,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 }
             }
         }
+        if let Mode::Array(a) = &mut app.mode {
+            a.drain();
+        }
         terminal.draw(|f| draw(f, app))?;
         if !event::poll(Duration::from_millis(60))? {
             continue;
@@ -312,6 +331,32 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             continue;
         }
         let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
+        if !matches!(app.mode, Mode::Menu) {
+            app.note = None;
+        }
+        if let Mode::Designer(d) = &mut app.mode {
+            if ctrl_c {
+                app.mode = Mode::Menu;
+            } else if let room::Outcome::Done(msg) = d.key(k) {
+                app.mode = Mode::Menu;
+                app.note = msg;
+            }
+            continue;
+        }
+        if let Mode::Array(a) = &app.mode {
+            if ctrl_c || matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') | KeyCode::Backspace) {
+                app.mode = Mode::Menu;
+            } else if k.code == KeyCode::Char('r') || k.code == KeyCode::Char('t') {
+                // r: re-capture the empty room · t: toggle tracker / every reflector
+                let diff = if k.code == KeyCode::Char('t') { !a.diff } else { a.diff };
+                app.mode = Mode::Menu; // stops the old thread first
+                match room::ArrayView::start(diff) {
+                    Ok(v) => app.mode = Mode::Array(v),
+                    Err(e) => app.note = Some(e),
+                }
+            }
+            continue;
+        }
         match &app.mode {
             Mode::Live(_) => {
                 if ctrl_c || matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') | KeyCode::Backspace) {
@@ -342,7 +387,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     _ => {}
                 }
             }
+            Mode::Designer(_) | Mode::Array(_) => {}
             Mode::Menu => {
+                app.note = None;
                 if ctrl_c {
                     app.quit = true;
                     continue;
@@ -394,8 +441,18 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_header(f, rows[0], app);
 
     let body = Layout::horizontal([Constraint::Length(43), Constraint::Min(20)]).split(rows[1]);
-    draw_menu(f, body[0], app);
+    let view = match &app.mode {
+        Mode::Designer(_) => 0,
+        Mode::Array(_) => 1,
+        Mode::Live(_) => 2,
+        _ => 3,
+    };
+    if view != 0 {
+        draw_menu(f, body[0], app);
+    }
     match &app.mode {
+        Mode::Designer(d) => room::draw_designer(f, body[0], body[1], d),
+        Mode::Array(a) => room::draw_array(f, body[1], a),
         Mode::Live(live) => draw_live(f, body[1], live),
         _ => draw_info(f, body[1], app),
     }
@@ -406,9 +463,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     let keys = match app.mode {
         Mode::Live(_) => " Esc/q back to menu · r re-capture background · Ctrl+C back ",
         Mode::AskLevels { .. } => " y use levels · n keep yours · Esc cancel ",
-        Mode::Menu => " ↑↓ select · Enter run · 1-6 jump · q quit ",
+        Mode::Designer(_) => " Tab device · arrows move · [ ] turn · n device · a/m add · x delete · Enter save · Esc cancel ",
+        Mode::Array(_) => " Esc/q back · r re-capture empty room · t tracker ⇄ every reflector ",
+        Mode::Menu => " ↑↓ select · Enter run · 1-8 jump · q quit ",
     };
-    f.render_widget(Paragraph::new(Line::from(Span::styled(keys, Style::new().fg(DIM)))), rows[2]);
+    let footer = match &app.note {
+        Some(n) => Line::from(Span::styled(format!(" {n}"), Style::new().fg(HIT).add_modifier(Modifier::BOLD))),
+        None => Line::from(Span::styled(keys, Style::new().fg(DIM))),
+    };
+    f.render_widget(Paragraph::new(footer), rows[2]);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {

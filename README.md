@@ -122,3 +122,17 @@ Coverage % is computed over the footprint, the bounding box of every detected wa
 ## Origin
 
 Grew out of `echo.py`, a Python proof of concept (chirp, matched filter, terminal bar chart). The same pipeline now lives in `src/dsp.rs`.
+
+
+## Multi-speaker / multi-mic arrays (v0.7)
+
+**Room designer** (menu `7`): draw your room to scale and place every speaker and microphone: where it sits, which way it faces, and which physical device it is (`n` cycles through your sound cards). Sizes show in metres and feet/inches. Saved to `~/.config/chirpmap/rooms/`.
+
+**Array tracker** (menu `8`): uses every speaker → mic pair in the layout at once. Each pair turns an echo delay into a path length *speaker → object → mic*, which on the floor plan is an ellipse with the speaker and mic at its foci. ChirpMap back-projects every pair's echoes onto the plan; where pairs agree, the object lights up on a heat map and gets a position in feet and inches.
+
+- 1 speaker + 1 mic = 1 pair (a distance, the direction is ambiguous)
+- 2 speakers + 2 mics = 4 pairs (a real 2D fix: about 20 cm in the simulator)
+- Speakers take turns pinging; every mic listens on every ping.
+- Each mic can be a different USB device with its own clock. ChirpMap anchors each pair using the direct speaker→mic sound and the distance from your layout, so the devices don't need to be synchronised.
+
+Keys: `r` re-captures the empty room, `t` switches between "what moves" and "every reflector".

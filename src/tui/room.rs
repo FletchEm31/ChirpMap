@@ -297,6 +297,7 @@ impl Backend {
 }
 
 const GUARD_M: f32 = 0.3;
+const GUARD_DIFF_M: f32 = 0.6;
 const CELL_M: f32 = 0.05;
 
 impl ArrayView {
@@ -376,7 +377,9 @@ fn run_array(l: plan::Layout, diff: bool, stop: Arc<AtomicBool>, tx: &Sender<AMs
             Some(b) => b.subtract(&pairs, fs, max_m),
             None => (pairs, 0.0),
         };
-        let img = array::backproject(&pairs, l.width_m, l.depth_m, CELL_M, fs, GUARD_M);
+        // Movers: a wider guard so leftover speaker ringing next to the devices isn't "someone".
+        let guard = if diff { GUARD_DIFF_M } else { GUARD_M };
+        let img = array::backproject(&pairs, l.width_m, l.depth_m, CELL_M, fs, guard);
         let peak = img.peak();
         let detected = !diff || peak.2 > th;
         if tx.send(AMsg::Frame { img, peak, detected }).is_err() {
@@ -409,7 +412,16 @@ pub(super) fn draw_array(f: &mut Frame, area: Rect, a: &ArrayView) {
         return;
     }
     let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4)]).split(inner);
+    let pairs = a.l.speakers().len() * a.l.mics().len();
+    let centre = {
+        let n = a.l.nodes.len().max(1) as f32;
+        (a.l.nodes.iter().map(|n| n.x).sum::<f32>() / n, a.l.nodes.iter().map(|n| n.y).sum::<f32>() / n)
+    };
     let (head, col) = match (a.peak, a.detected) {
+        (Some((x, y, _)), true) if pairs < 2 => (
+            format!("◯ ≈ {} from the desk — 1 pair gives distance only; add a 2nd mic (7) for a 2D fix", fmt_len(plan::dist((x, y), centre))),
+            HIT,
+        ),
         (Some((x, y, _)), true) => (
             format!("◉ {} across · {} up the plan", fmt_len(x), fmt_len(y)),
             HIT,
@@ -426,7 +438,7 @@ pub(super) fn draw_array(f: &mut Frame, area: Rect, a: &ArrayView) {
         parts[0],
     );
     let mark = match (a.peak, a.detected) {
-        (Some((x, y, _)), true) => Some((x, y)),
+        (Some((x, y, _)), true) if pairs >= 2 => Some((x, y)),
         _ => None,
     };
     draw_plan(f, parts[1], &a.l, a.img.as_ref(), mark, None, room_title(&a.l));

@@ -43,7 +43,7 @@ const ITEMS: &[Item] = &[
         help: "Measures room noise, the usable frequency band, volume and speaker ring-down for this speaker + mic. Can also tune system volume and mic sensitivity (asks first, always restores)." },
     Item { key: '4', name: "Scan a room", blurb: "rotate-and-ping plan",
         help: "Turn the speaker+mic through 8 headings to build a blueprint floor plan with measured / assumed / unscanned coverage. Saves JSON + SVG to ~/chirpmap-scans." },
-    Item { key: '5', name: "Hardware panel", blurb: "speakers, mics, profiles",
+    Item { key: '5', name: "Hardware panel", blurb: "speakers & mics",
         help: "Every speaker and microphone the system exposes, what they can do, and which ones are calibrated." },
     Item { key: '6', name: "Simulator demo", blurb: "fake room, no hardware",
         help: "Scans a simulated 5.2 × 4.1 m room (17' × 13'). Shows what a finished map looks like without making a sound." },

@@ -2,7 +2,7 @@
 
 # ChirpMap
 
-Terminal-native acoustic echolocation that maps rooms like an architect's blueprint, using any speaker and mic. Fully offline. Written in Rust.
+Terminal-native acoustic echolocation that maps rooms like blueprint - monitors changes, movement and activity, using any speaker and mic. Fully offline. Written in Rust.
 
 ChirpMap plays a short frequency sweep (a *chirp*) through your speaker, records the mic at the same time, and matched-filters the recording to find echoes. Rotate the device through a few headings and it builds a floor plan in your terminal, plus an SVG blueprint with dimensions and a title block.
 

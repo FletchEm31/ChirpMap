@@ -4,6 +4,8 @@ use super::*;
 use crate::array::{self, ArrayBackground, ArrayIo, CpalArray, Image, SimArray};
 use crate::layout::{self as plan, Kind, Node};
 use ratatui::crossterm::event::KeyEvent;
+use std::collections::VecDeque;
+use std::time::Instant;
 
 // ------------------------------------------------------------------ shared floor-plan drawing
 
@@ -29,7 +31,26 @@ fn arrow(deg: f32) -> char {
 /// Draw the room to scale like an architect's plan: wall dimensions on the
 /// walls, optional heat image, devices, guide lines for the selected device,
 /// and a target marker.
-fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, mark: Option<(f32, f32)>, sel: Option<usize>, title: String) {
+/// A movement detection on the plan: position and age in seconds.
+#[derive(Clone, Copy)]
+pub(super) struct Ping {
+    pub x: f32,
+    pub y: f32,
+    pub age: f32,
+}
+
+const RING_S: f32 = 1.2; // how long a ping's ring keeps expanding
+const TRAIL_S: f32 = 4.0; // how long the fading trail stays on the plan
+const TRAIL_N: usize = 8; // at most this many trail dots
+const PING_GAP_S: f32 = 0.33; // minimum time between pings
+
+fn fade(to: (u8, u8, u8), t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let (n0, n1, n2) = (13.0, 59.0, 102.0); // navy
+    Color::Rgb((n0 + (to.0 as f32 - n0) * t) as u8, (n1 + (to.1 as f32 - n1) * t) as u8, (n2 + (to.2 as f32 - n2) * t) as u8)
+}
+
+fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, pings: &[Ping], sel: Option<usize>, title: String, alert: bool) {
     const LEFT: u16 = 11; // room for the depth dimension down the left wall
     const TOP: u16 = 1; // room for the width dimension along the top wall
     let aw = area.width.saturating_sub(2 + LEFT).max(4) as f32;
@@ -130,9 +151,32 @@ fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, m
             }
         }
     }
-    if let Some((x, y)) = mark {
-        let (r, c) = to_cell(x, y);
-        grid[r][c] = ("◉".into(), Style::new().fg(HIT).bg(NAVY).add_modifier(Modifier::BOLD));
+    // Radar: each detection sends out a red ring that grows and fades; older
+    // detections stay as a fading red trail; the newest is a solid red ◉.
+    let mut ringed: Vec<&Ping> = pings.iter().filter(|p| p.age < RING_S).collect();
+    ringed.sort_by(|a, b| a.age.total_cmp(&b.age));
+    for p in ringed.into_iter().take(2) {
+        let radius = 0.12 + p.age / RING_S * 0.75;
+        let t = 1.0 - p.age / RING_S;
+        for (r, row) in grid.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                let x = (c as f32 + 0.5) * s / 2.0;
+                let y = l.depth_m - (r as f32 + 0.5) * s;
+                if (plan::dist((x, y), (p.x, p.y)) - radius).abs() < s * 0.45 {
+                    cell.0 = "∘".into();
+                    cell.1 = cell.1.fg(fade((255, 77, 77), t)).add_modifier(Modifier::BOLD);
+                }
+            }
+        }
+    }
+    let newest = pings.iter().map(|p| p.age).fold(f32::MAX, f32::min);
+    for p in pings.iter().filter(|p| p.age < TRAIL_S) {
+        let (r, c) = to_cell(p.x, p.y);
+        if p.age == newest && p.age < 0.8 {
+            grid[r][c] = ("◉".into(), Style::new().fg(RED).bg(NAVY).add_modifier(Modifier::BOLD));
+        } else {
+            grid[r][c] = ("•".into(), Style::new().fg(fade((255, 120, 120), 1.0 - p.age / TRAIL_S)).bg(NAVY));
+        }
     }
     let lines: Vec<Line> = grid
         .into_iter()
@@ -140,7 +184,7 @@ fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, m
         .collect();
     let block = Block::bordered()
         .border_type(BorderType::Thick)
-        .border_style(Style::new().fg(Color::White))
+        .border_style(Style::new().fg(if alert { RED } else { Color::White }))
         .title(Span::styled(title, Style::new().fg(LINE)))
         .title(Line::from(Span::styled(" TOP WALL ", Style::new().fg(DIM))).alignment(Alignment::Right))
         .title_bottom(Line::from(Span::styled(" BOTTOM WALL ", Style::new().fg(DIM))).alignment(Alignment::Right));
@@ -369,7 +413,7 @@ pub(super) fn draw_designer(f: &mut Frame, left: Rect, right: Rect, d: &Designer
     }
     let block = Block::bordered().border_type(BorderType::Plain).border_style(Style::new().fg(LINE)).title(Span::styled(" ROOM DESIGNER ", Style::new().fg(LINE)));
     f.render_widget(Paragraph::new(lines).block(block), left);
-    draw_plan(f, right, &d.l, None, None, Some(d.sel), room_title(&d.l));
+    draw_plan(f, right, &d.l, None, &[], Some(d.sel), room_title(&d.l), false);
 }
 
 // ------------------------------------------------------------------ 2D array tracker
@@ -394,6 +438,8 @@ pub(super) struct ArrayView {
     detected: bool,
     frames: u64,
     error: Option<String>,
+    /// Recent movement detections for the radar view.
+    pings: VecDeque<((f32, f32), Instant)>,
 }
 
 impl Drop for ArrayView {
@@ -450,6 +496,7 @@ impl ArrayView {
             detected: false,
             frames: 0,
             error: None,
+            pings: VecDeque::new(),
         })
     }
 
@@ -463,9 +510,21 @@ impl ArrayView {
                     self.img = Some(img);
                     self.peak = Some(peak);
                     self.detected = detected;
+                    let pairs = self.l.speakers().len() * self.l.mics().len();
+                    // One ping per ~⅓ s keeps the radar readable at any frame rate.
+                    let due = self.pings.back().map_or(true, |(_, t)| t.elapsed().as_secs_f32() >= PING_GAP_S);
+                    if self.diff && detected && pairs >= 2 && due {
+                        self.pings.push_back(((peak.0, peak.1), Instant::now()));
+                    }
                 }
                 AMsg::Error(e) => self.error = Some(e),
             }
+        }
+        while self.pings.front().is_some_and(|(_, t)| t.elapsed().as_secs_f32() > TRAIL_S) {
+            self.pings.pop_front();
+        }
+        while self.pings.len() > TRAIL_N {
+            self.pings.pop_front();
         }
     }
 }
@@ -513,10 +572,12 @@ fn run_array(l: plan::Layout, diff: bool, stop: Arc<AtomicBool>, tx: &Sender<AMs
 }
 
 pub(super) fn draw_array(f: &mut Frame, area: Rect, a: &ArrayView) {
-    let title = if a.diff { " ARRAY TRACKER · 2D · what moves " } else { " ARRAY · 2D · every reflector " };
+    let title = if a.diff { " ARRAY TRACKER · 2D · radar " } else { " ARRAY · 2D · every reflector " };
+    let pings: Vec<Ping> = a.pings.iter().map(|((x, y), t)| Ping { x: *x, y: *y, age: t.elapsed().as_secs_f32() }).collect();
+    let alert = pings.iter().any(|p| p.age < 0.35);
     let block = Block::bordered()
         .border_type(BorderType::Plain)
-        .border_style(Style::new().fg(LINE))
+        .border_style(Style::new().fg(if alert { RED } else { LINE }))
         .title(Span::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
         .title(Line::from(Span::styled(format!(" {} frames ", a.frames), Style::new().fg(DIM))).alignment(Alignment::Right));
     let inner = block.inner(area);
@@ -545,8 +606,12 @@ pub(super) fn draw_array(f: &mut Frame, area: Rect, a: &ArrayView) {
             format!("◯ ≈ {} from the desk — 1 pair gives distance only; add a 2nd mic (7) for a 2D fix", fmt_len(plan::dist((x, y), centre))),
             HIT,
         ),
+        (Some((x, y, _)), true) if a.diff => (
+            format!("● MOVEMENT · {} across · {} up the plan", fmt_len(x), fmt_len(y)),
+            RED,
+        ),
         (Some((x, y, _)), true) => (
-            format!("◉ {} across · {} up the plan", fmt_len(x), fmt_len(y)),
+            format!("◉ strongest reflector · {} across · {} up the plan", fmt_len(x), fmt_len(y)),
             HIT,
         ),
         (Some(_), false) => ("· nothing moving ·".to_string(), DIM),
@@ -560,9 +625,11 @@ pub(super) fn draw_array(f: &mut Frame, area: Rect, a: &ArrayView) {
         ]),
         parts[0],
     );
-    let mark = match (a.peak, a.detected) {
-        (Some((x, y, _)), true) if pairs >= 2 => Some((x, y)),
-        _ => None,
+    // "Every reflector" mode has no pings; show its strongest reflector as one.
+    let shown: Vec<Ping> = match (a.diff, a.peak, a.detected) {
+        (false, Some((x, y, _)), true) if pairs >= 2 => vec![Ping { x, y, age: 0.0 }],
+        (false, _, _) => Vec::new(),
+        _ => pings,
     };
-    draw_plan(f, parts[1], &a.l, a.img.as_ref(), mark, None, room_title(&a.l));
+    draw_plan(f, parts[1], &a.l, a.img.as_ref(), &shown, None, room_title(&a.l), alert);
 }

@@ -32,6 +32,7 @@ const WARN: Color = Color::Rgb(0xFF, 0x9F, 0x6B);
 const OK: Color = Color::Rgb(0xA8, 0xE6, 0xB8);
 const BAR: Color = ACCENT;
 const HIT: Color = Color::Rgb(0xFF, 0xD6, 0x66); // the yellow dot
+const RED: Color = Color::Rgb(0xFF, 0x4D, 0x4D); // movement / radar ping
 
 const MAX_RANGE: f32 = 4.0;
 
@@ -551,6 +552,7 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_live(f: &mut Frame, area: Rect, live: &Live) {
     let title = if live.diff { " LIVE TRACKER · change vs background " } else { " LIVE ECHOES " };
+    let hitc = if live.diff { RED } else { HIT };
     let block = Block::bordered()
         .border_type(BorderType::Plain)
         .border_style(Style::new().fg(LINE))
@@ -578,8 +580,8 @@ fn draw_live(f: &mut Frame, area: Rect, live: &Live) {
         Some((_, echoes, _, _)) if !echoes.is_empty() => {
             let e = &echoes[0];
             (
-                format!("▶ {}   {:.0} dB{}", fmt_len(e.dist_m), e.db(), if echoes.len() > 1 { format!("   (+{} more)", echoes.len() - 1) } else { String::new() }),
-                HIT,
+                format!("{} {}   {:.0} dB{}", if live.diff { "● MOVEMENT" } else { "▶" }, fmt_len(e.dist_m), e.db(), if echoes.len() > 1 { format!("   (+{} more)", echoes.len() - 1) } else { String::new() }),
+                hitc,
             )
         }
         Some(_) => (if live.diff { "· nothing moving ·".to_string() } else { "· no echoes above threshold ·".to_string() }, DIM),
@@ -621,11 +623,11 @@ fn draw_live(f: &mut Frame, area: Rect, live: &Live) {
             let hit = echoes.iter().any(|e| e.dist_m >= lo && e.dist_m < lo + bin);
             let len = ((v / top) * bar_w as f32) as usize;
             let label = format!("{lo:5.2} m {:>7} ", feet_inches(lo));
-            let lbl_style = if hit { Style::new().fg(HIT).add_modifier(Modifier::BOLD) } else { Style::new().fg(DIM) };
-            let bar_style = if hit { Style::new().fg(HIT) } else if lo < *blank { Style::new().fg(DIM) } else { Style::new().fg(BAR) };
+            let lbl_style = if hit { Style::new().fg(hitc).add_modifier(Modifier::BOLD) } else { Style::new().fg(DIM) };
+            let bar_style = if hit { Style::new().fg(hitc) } else if lo < *blank { Style::new().fg(DIM) } else { Style::new().fg(BAR) };
             let mut spans = vec![Span::styled(label, lbl_style), Span::styled("┤", Style::new().fg(LINE)), Span::styled("█".repeat(len.min(bar_w)), bar_style)];
             if hit {
-                spans.push(Span::styled(" ◀", Style::new().fg(HIT).add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(" ◀", Style::new().fg(hitc).add_modifier(Modifier::BOLD)));
             }
             Line::from(spans)
         })

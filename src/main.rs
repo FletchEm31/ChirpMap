@@ -8,6 +8,7 @@ mod dsp;
 mod layout;
 mod levels;
 mod map;
+mod pwio;
 mod render;
 mod tui;
 
@@ -201,7 +202,7 @@ fn ask_yes(prompt: &str) -> Result<bool> {
 }
 
 /// Ask permission (and a speaker ceiling) before touching system levels.
-fn ask_levels_for_calibration() -> Result<Option<(levels::Session, u32)>> {
+fn ask_levels_for_calibration(sink: Option<&str>, source: Option<&str>) -> Result<Option<(levels::Session, u32)>> {
     if !levels::available() {
         return Ok(None);
     }
@@ -210,7 +211,7 @@ fn ask_levels_for_calibration() -> Result<Option<(levels::Session, u32)>> {
         println!("OK — leaving your levels alone.\n");
         return Ok(None);
     }
-    let cur = levels::current_speaker_pct().unwrap_or(0);
+    let cur = levels::current_speaker_pct(sink).unwrap_or(0);
     let cap = loop {
         let a = read_line(&format!(
             "Highest speaker volume ChirpMap may use, 10–100% (yours is {cur}% now) [60]: "
@@ -224,7 +225,7 @@ fn ask_levels_for_calibration() -> Result<Option<(levels::Session, u32)>> {
         }
     };
     println!();
-    Ok(levels::Session::begin().map(|s| (s, cap)))
+    Ok(levels::Session::begin_for(sink, source).map(|s| (s, cap)))
 }
 
 /// If calibration saved levels, offer to use them for this run (restored afterwards).
@@ -368,7 +369,13 @@ fn run(cmd: Cmd) -> Result<()> {
                 print!("{}", audio::in_use_block(dev.output.as_deref(), dev.input.as_deref()));
             }
             let mut sonar = open(&dev)?;
-            let session = if dev.sim { None } else { ask_levels_for_calibration()? };
+            let session = if dev.sim {
+                None
+            } else {
+                let pw = |d: &Option<String>| d.as_deref().and_then(|x| audio::resolve_device(x).1).map(str::to_string);
+                let (sink, source) = (pw(&dev.output), pw(&dev.input));
+                ask_levels_for_calibration(sink.as_deref(), source.as_deref())?
+            };
             let result = calib::run(sonar.as_mut(), session.as_ref().map(|(s, cap)| (s, *cap)));
             drop(session); // puts your levels back, success or failure
             let p = result?;

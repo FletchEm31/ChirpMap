@@ -121,43 +121,71 @@ impl ArrayIo for CpalArray {
 
     fn ping(&mut self, spk: usize, sig: &[f32], listen_s: f32, volume: f32) -> Result<Vec<Vec<f32>>> {
         let out = self.outs.get(spk).context("no such speaker")?;
+        // Mics: devices picked by name record through pw-record; the default via cpal.
         let bufs: Vec<Arc<Mutex<Vec<f32>>>> = self.ins.iter().map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
+        let mut pw_recs: Vec<Option<crate::pwio::Recording>> = Vec::new();
+        for (k, p) in self.ins.iter().enumerate() {
+            pw_recs.push(match &p.pw {
+                Some(node) => Some(crate::pwio::record(node, self.fs, k)?),
+                None => None,
+            });
+        }
         let ins: Vec<Stream> = quiet(|| -> Result<Vec<Stream>> {
             let mut v = Vec::new();
             for (p, b) in self.ins.iter().zip(&bufs) {
-                crate::audio::route_next_stream(p.pw.as_deref());
-                let s = build_input(&p.dev, &p.cfg, p.fmt, b.clone())?;
-                s.play()?;
-                v.push(s);
+                if p.pw.is_none() {
+                    let s = build_input(&p.dev, &p.cfg, p.fmt, b.clone())?;
+                    s.play()?;
+                    v.push(s);
+                }
             }
             Ok(v)
         })?;
-        std::thread::sleep(Duration::from_millis(60));
+        let warm = if pw_recs.iter().any(Option::is_some) { crate::pwio::RECORD_WARMUP } else { Duration::from_millis(60) };
+        std::thread::sleep(warm);
 
-        let r = out.rate as f32;
         let scaled: Vec<f32> = sig.iter().map(|x| x * volume).collect();
-        let mut play = vec![0.0f32; (0.05 * r) as usize];
-        play.extend(resample(&scaled, self.fs, out.rate));
-        play.extend(std::iter::repeat(0.0).take((listen_s * r) as usize));
-        let dur = play.len() as f32 / r + 0.3;
-        let outs = quiet(|| -> Result<Stream> {
-            crate::audio::route_next_stream(out.pw.as_deref());
-            let s = build_output(&out.dev, &out.cfg, out.fmt, Arc::new(play), Arc::new(AtomicUsize::new(0)), out.only)?;
-            s.play()?;
-            Ok(s)
-        })?;
-        std::thread::sleep(Duration::from_secs_f32(dur));
-        drop(outs);
+        match &out.pw {
+            Some(node) => {
+                // Speaker picked by name: pw-play targets it reliably.
+                let player = crate::pwio::play(node, self.fs, out.cfg.channels, out.only, &scaled)?;
+                crate::pwio::wait_player(player)?;
+                std::thread::sleep(Duration::from_secs_f32(listen_s + 0.3));
+            }
+            None => {
+                let r = out.rate as f32;
+                let mut play = vec![0.0f32; (0.05 * r) as usize];
+                play.extend(resample(&scaled, self.fs, out.rate));
+                play.extend(std::iter::repeat(0.0).take((listen_s * r) as usize));
+                let dur = play.len() as f32 / r + 0.3;
+                let outs = quiet(|| -> Result<Stream> {
+                    let s = build_output(&out.dev, &out.cfg, out.fmt, Arc::new(play), Arc::new(AtomicUsize::new(0)), out.only)?;
+                    s.play()?;
+                    Ok(s)
+                })?;
+                std::thread::sleep(Duration::from_secs_f32(dur));
+                drop(outs);
+            }
+        }
         std::thread::sleep(Duration::from_millis(20));
         drop(ins);
 
         let mut recs = Vec::new();
-        for (p, b) in self.ins.iter().zip(&bufs) {
-            let rec = b.lock().map(|g| g.clone()).unwrap_or_default();
+        for ((p, b), pr) in self.ins.iter().zip(&bufs).zip(pw_recs) {
+            let rec = match pr {
+                Some(r) => {
+                    let (x, rate) = r.stop()?;
+                    resample(&x, rate.max(1), self.fs)
+                }
+                None => {
+                    let x = b.lock().map(|g| g.clone()).unwrap_or_default();
+                    resample(&x, p.rate, self.fs)
+                }
+            };
             if rec.is_empty() {
-                bail!("a microphone recorded nothing ({}) — is it muted or in use?", dev_name(&p.dev));
+                bail!("a microphone recorded nothing ({}) — is it muted or in use?", p.pw.clone().unwrap_or_else(|| dev_name(&p.dev)));
             }
-            recs.push(resample(&rec, p.rate, self.fs));
+            recs.push(rec);
         }
         Ok(recs)
     }

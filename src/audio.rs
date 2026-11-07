@@ -154,14 +154,6 @@ pub fn resolve_device(device: &str) -> (Option<&str>, Option<&str>) {
     }
 }
 
-/// Point the next ALSA "pipewire" stream at a specific node (or the default).
-/// pipewire-alsa reads PIPEWIRE_NODE when a stream is opened.
-pub fn route_next_stream(target: Option<&str>) {
-    match target {
-        Some(t) => std::env::set_var("PIPEWIRE_NODE", t),
-        None => std::env::remove_var("PIPEWIRE_NODE"),
-    }
-}
 
 /// The speaker and mic the system "default" device actually routes to (Linux, via pactl).
 pub fn system_defaults() -> Option<(Endpoint, Endpoint)> {
@@ -172,6 +164,25 @@ pub fn system_defaults() -> Option<(Endpoint, Endpoint)> {
 
 /// (speaker, mic, problem-with-mic) for what ChirpMap will use.
 pub fn in_use(output: Option<&str>, input: Option<&str>) -> (String, String, Option<&'static str>) {
+    // Devices picked by PipeWire name: show their real description.
+    let named = |sel: Option<&str>, kind: &str| {
+        let node = sel?.strip_prefix("pw:")?;
+        Some(pw_endpoints(kind).into_iter().find(|(n, _)| n == node).map_or(node.to_string(), |(_, d)| d))
+    };
+    let (o, i) = (named(output, "sinks"), named(input, "sources"));
+    if o.is_some() || i.is_some() {
+        let (d_spk, d_mic, d_warn) = in_use_default_parts(output, input);
+        let spk = o.unwrap_or(d_spk);
+        let (mic, warn) = match i {
+            Some(m) => (m, None),
+            None => (d_mic, d_warn),
+        };
+        return (spk, mic, warn);
+    }
+    in_use_default_parts(output, input)
+}
+
+fn in_use_default_parts(output: Option<&str>, input: Option<&str>) -> (String, String, Option<&'static str>) {
     let routed = |sel: Option<&str>| sel.map_or(true, |s| s == "default" || s == "pipewire" || s == "pulse");
     let defaults = system_defaults();
     match (&defaults, routed(output), routed(input)) {
@@ -429,15 +440,44 @@ impl Sonar for CpalSonar {
         let buf = Arc::new(Mutex::new(Vec::with_capacity(
             (dur * self.in_rate as f32) as usize + 4096,
         )));
-        let ins = quiet(|| -> Result<Stream> {
-            route_next_stream(self.in_pw.as_deref());
-            let s = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
-            s.play()?;
-            Ok(s)
-        })?;
+        // Devices picked by name go through pw-record / pw-play (reliable targeting).
+        let pw_rec = match &self.in_pw {
+            Some(node) => Some(crate::pwio::record(node, self.fs, 0)?),
+            None => None,
+        };
+        let ins = if pw_rec.is_none() {
+            Some(quiet(|| -> Result<Stream> {
+                let s = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
+                s.play()?;
+                Ok(s)
+            })?)
+        } else {
+            std::thread::sleep(crate::pwio::RECORD_WARMUP);
+            None
+        };
         std::thread::sleep(Duration::from_millis(40));
+        if let Some(node) = self.out_pw.clone() {
+            let scaled: Vec<f32> = sig.iter().map(|x| x * volume).collect();
+            let player = crate::pwio::play(&node, self.fs, self.out_cfg.channels, None, &scaled)?;
+            crate::pwio::wait_player(player)?;
+            std::thread::sleep(Duration::from_secs_f32(listen_s + 0.3));
+            drop(ins);
+            let rec = match pw_rec {
+                Some(r) => {
+                    let (x, rate) = r.stop()?;
+                    resample(&x, rate.max(1), self.fs)
+                }
+                None => {
+                    let x = buf.lock().map_err(|_| anyhow!("recording buffer poisoned"))?.clone();
+                    resample(&x, self.in_rate, self.fs)
+                }
+            };
+            if rec.is_empty() {
+                bail!("recorded nothing — is the microphone muted, blocked, or in use?");
+            }
+            return Ok(rec);
+        }
         let outs = quiet(|| -> Result<Stream> {
-            route_next_stream(self.out_pw.as_deref());
             let s = build_output(
                 &self.out,
                 &self.out_cfg,
@@ -454,20 +494,34 @@ impl Sonar for CpalSonar {
         std::thread::sleep(Duration::from_millis(20));
         drop(ins);
 
-        let rec = buf
-            .lock()
-            .map_err(|_| anyhow!("recording buffer poisoned"))?
-            .clone();
+        let rec = match pw_rec {
+            Some(r) => {
+                let (x, rate) = r.stop()?;
+                resample(&x, rate.max(1), self.fs)
+            }
+            None => {
+                let x = buf.lock().map_err(|_| anyhow!("recording buffer poisoned"))?.clone();
+                resample(&x, self.in_rate, self.fs)
+            }
+        };
         if rec.is_empty() {
             bail!("recorded nothing — is the microphone muted, blocked, or in use?");
         }
-        Ok(resample(&rec, self.in_rate, self.fs))
+        Ok(rec)
     }
 
     fn record(&mut self, secs: f32) -> Result<Vec<f32>> {
+        if let Some(node) = self.in_pw.clone() {
+            let r = crate::pwio::record(&node, self.fs, 0)?;
+            std::thread::sleep(crate::pwio::RECORD_WARMUP + Duration::from_secs_f32(secs));
+            let (x, rate) = r.stop()?;
+            if x.is_empty() {
+                bail!("recorded nothing — is the microphone muted, blocked, or in use?");
+            }
+            return Ok(resample(&x, rate.max(1), self.fs));
+        }
         let buf = Arc::new(Mutex::new(Vec::new()));
         let ins = quiet(|| -> Result<Stream> {
-            route_next_stream(self.in_pw.as_deref());
             let s = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
             s.play()?;
             Ok(s)

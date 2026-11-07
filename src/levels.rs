@@ -53,13 +53,20 @@ pub fn available() -> bool {
     out(&["get-default-sink"]).is_some() && out(&["get-default-source"]).is_some()
 }
 
-pub fn current_speaker_pct() -> Option<u32> {
-    percents(&out(&["get-sink-volume", "@DEFAULT_SINK@"])?).into_iter().max()
+/// Volume of a specific speaker (PipeWire sink name), or the default one.
+pub fn current_speaker_pct(sink: Option<&str>) -> Option<u32> {
+    percents(&out(&["get-sink-volume", sink.unwrap_or("@DEFAULT_SINK@")])?).into_iter().max()
 }
 
-fn snapshot() -> Option<Saved> {
-    let sink = out(&["get-default-sink"])?;
-    let source = out(&["get-default-source"])?;
+fn snapshot(sink: Option<&str>, source: Option<&str>) -> Option<Saved> {
+    let sink = match sink {
+        Some(s) => s.to_string(),
+        None => out(&["get-default-sink"])?,
+    };
+    let source = match source {
+        Some(s) => s.to_string(),
+        None => out(&["get-default-source"])?,
+    };
     Some(Saved {
         sink_vol: percents(&out(&["get-sink-volume", &sink])?),
         source_vol: percents(&out(&["get-source-volume", &source])?),
@@ -146,8 +153,15 @@ pub struct Session {
 }
 
 impl Session {
+    /// Take control of the default speaker and mic.
     pub fn begin() -> Option<Session> {
-        let s = snapshot()?;
+        Self::begin_for(None, None)
+    }
+
+    /// Take control of a specific speaker / mic (PipeWire node names), the
+    /// ones actually being measured — not whatever happens to be the default.
+    pub fn begin_for(sink: Option<&str>, source: Option<&str>) -> Option<Session> {
+        let s = snapshot(sink, source)?;
         let path = restore_file();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);

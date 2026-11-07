@@ -10,9 +10,9 @@ Terminal-native acoustic echolocation that maps rooms like blueprint - monitors 
 ChirpMap plays a short frequency sweep (a *chirp*) through your speaker, records the mic at the same time, and matched-filters the recording to find echoes. Rotate the device through a few headings and it builds a floor plan in your terminal, plus an SVG blueprint with dimensions and a title block.
 
 ---
+
 ***Notice: ChirpMap is experimental software provided "as-is" and under active development starting on 11-7-2026.  Because performance, accuracy, and acoustic results depend heavily on individual hardware capabilities and room enviroment, the authors assume no liability for hardware performance, audio adjustments, or measurement accuracy. User assumes any and all risk.***
 
----
 ---
 
 ## Set Up 

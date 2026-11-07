@@ -19,11 +19,17 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 // Blueprint palette.
-const ACCENT: Color = Color::Rgb(120, 200, 255);
-const DIM: Color = Color::Rgb(90, 120, 150);
-const WARN: Color = Color::Rgb(255, 200, 90);
-const BAR: Color = Color::Rgb(70, 150, 220);
-const HIT: Color = Color::Rgb(255, 214, 102);
+// Brand: board B, "Blueprint + sonar mark".
+const NAVY: Color = Color::Rgb(0x0D, 0x3B, 0x66); // blueprint paper
+const PANEL: Color = Color::Rgb(0x12, 0x30, 0x4D); // popups, icon tile
+const LINE: Color = Color::Rgb(0xCF, 0xE6, 0xFF); // drafting lines, labels
+const ACCENT: Color = Color::Rgb(0x8C, 0xC8, 0xFF); // sonar arcs, data
+const DIM: Color = Color::Rgb(0x9D, 0xB8, 0xD6); // secondary text (passes 4.5:1 on navy)
+const FAINT: Color = Color::Rgb(0x4E, 0x7A, 0xA6); // grid ticks, outermost arc
+const WARN: Color = Color::Rgb(0xFF, 0x9F, 0x6B);
+const OK: Color = Color::Rgb(0xA8, 0xE6, 0xB8);
+const BAR: Color = ACCENT;
+const HIT: Color = Color::Rgb(0xFF, 0xD6, 0x66); // the yellow dot
 
 const MAX_RANGE: f32 = 4.0;
 
@@ -366,13 +372,19 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let outer = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_type(BorderType::Double)
+        .border_style(Style::new().fg(LINE))
+        .style(Style::new().bg(NAVY).fg(Color::White))
         .title(Line::from(vec![
-            Span::styled(" ◉ CHIRPMAP ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" ((", Style::new().fg(FAINT).add_modifier(Modifier::BOLD)),
+            Span::styled("(", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled("●", Style::new().fg(HIT).add_modifier(Modifier::BOLD)),
+            Span::styled(")", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(")) ", Style::new().fg(FAINT).add_modifier(Modifier::BOLD)),
+            Span::styled("CHIRPMAP ", Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::new().fg(DIM)),
         ]))
-        .title(Line::from(Span::styled(" acoustic room mapping · offline ", Style::new().fg(DIM))).alignment(Alignment::Right));
+        .title(Line::from(Span::styled(" acoustic room mapping · measured by sound ", Style::new().fg(DIM))).alignment(Alignment::Right));
     let area = f.area();
     let inner = outer.inner(area);
     f.render_widget(outer, area);
@@ -400,13 +412,13 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let label = |t: &'static str| Span::styled(format!(" {t:<12}"), Style::new().fg(DIM));
+    let label = |t: &'static str| Span::styled(format!(" {t:<12}│ "), Style::new().fg(DIM));
     let mut lines = vec![
         Line::from(vec![label("SPEAKER"), Span::raw(app.speaker.clone()).bold()]),
         Line::from(vec![label("MICROPHONE"), Span::raw(app.mic.clone()).bold()]),
         Line::from(vec![
             label("CALIBRATION"),
-            Span::styled(app.calib.0.clone(), Style::new().fg(if app.calib.1 { Color::Rgb(140, 220, 160) } else { WARN })),
+            Span::styled(app.calib.0.clone(), Style::new().fg(if app.calib.1 { OK } else { WARN })),
         ]),
     ];
     if let Some(w) = app.mic_warn {
@@ -415,7 +427,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             Style::new().fg(WARN).add_modifier(Modifier::BOLD),
         )));
     }
-    let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(DIM)).title(" in use ");
+    let block = Block::bordered().border_type(BorderType::Plain).border_style(Style::new().fg(LINE)).title(Span::styled(" SHEET 1 · IN USE ", Style::new().fg(LINE)));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -431,38 +443,54 @@ fn draw_menu(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(DIM)).title(" menu "))
-        .highlight_style(Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
+        .block(Block::bordered().border_type(BorderType::Plain).border_style(Style::new().fg(LINE)).title(Span::styled(" MENU ", Style::new().fg(LINE))))
+        .highlight_style(Style::new().fg(NAVY).bg(ACCENT).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶");
     f.render_stateful_widget(list, area, &mut app.state);
 }
 
+/// Block-letter wordmark, 5 rows.
+const WORDMARK: [&str; 5] = [
+    " ███  █  █  ███  ███   ███   █   █   ██   ███ ",
+    "█     █  █   █   █  █  █  █  ██ ██  █  █  █  █",
+    "█     ████   █   ███   ███   █ █ █  ████  ███ ",
+    "█     █  █   █   █ █   █     █   █  █  █  █   ",
+    " ███  █  █  ███  █  █  █     █   █  █  █  █   ",
+];
+
+fn sonar_mark() -> Vec<Line<'static>> {
+    // Three arcs each side of the yellow dot, fading outward, like the logo.
+    let arc = |c: &'static str, col: Color| Span::styled(c, Style::new().fg(col).add_modifier(Modifier::BOLD));
+    vec![
+        Line::from(vec![arc("╭  ", FAINT), arc("╭  ", DIM), arc("╭     ", ACCENT), arc("╮  ", ACCENT), arc("╮  ", DIM), arc("╮", FAINT)]).alignment(Alignment::Center),
+        Line::from(vec![arc("│  ", FAINT), arc("│  ", DIM), arc("│  ", ACCENT), arc("●", HIT), arc("  │  ", ACCENT), arc("│  ", DIM), arc("│", FAINT)]).alignment(Alignment::Center),
+        Line::from(vec![arc("╰  ", FAINT), arc("╰  ", DIM), arc("╰     ", ACCENT), arc("╯  ", ACCENT), arc("╯  ", DIM), arc("╯", FAINT)]).alignment(Alignment::Center),
+    ]
+}
+
 fn draw_info(f: &mut Frame, area: Rect, app: &App) {
     let it = &ITEMS[app.state.selected().unwrap_or(0)];
-    let logo = [
-        "        )  )  )   ◉   (  (  (        ",
-        "      )  )  )     |     (  (  (      ",
-        "                  |                  ",
-        "      chirp → echo → distance        ",
-    ];
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line> = vec![Line::raw("")];
+    lines.extend(sonar_mark());
     lines.push(Line::raw(""));
-    for l in logo {
-        lines.push(Line::from(Span::styled(l, Style::new().fg(ACCENT))).alignment(Alignment::Center));
+    let pad = " ".repeat((area.width.saturating_sub(2) as usize).saturating_sub(46) / 2);
+    for w in WORDMARK {
+        lines.push(Line::from(Span::styled(format!("{pad}{w}"), Style::new().fg(Color::White).add_modifier(Modifier::BOLD))));
     }
+    lines.push(Line::from(Span::styled("├──── 17' 3\" × 13' 7\" · measured by sound ────┤", Style::new().fg(LINE))).alignment(Alignment::Center));
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(it.name, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))).alignment(Alignment::Center));
+    lines.push(Line::from(Span::styled(format!("▸ {}", it.name.to_uppercase()), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))).alignment(Alignment::Center));
     lines.push(Line::raw(""));
-    lines.push(Line::raw(it.help).alignment(Alignment::Center));
-    let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(DIM));
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(block), area);
+    lines.push(Line::from(Span::styled(it.help, Style::new().fg(DIM))).alignment(Alignment::Center));
+    let block = Block::bordered().border_type(BorderType::Plain).border_style(Style::new().fg(LINE));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
 }
 
 fn draw_live(f: &mut Frame, area: Rect, live: &Live) {
     let title = if live.diff { " LIVE TRACKER · change vs background " } else { " LIVE ECHOES " };
     let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(LINE))
         .title(Span::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
         .title(Line::from(Span::styled(format!(" {} readings ", live.readings), Style::new().fg(DIM))).alignment(Alignment::Right));
     let inner = block.inner(area);
@@ -532,7 +560,7 @@ fn draw_live(f: &mut Frame, area: Rect, live: &Live) {
             let label = format!("{lo:5.2} m {:>7} ", feet_inches(lo));
             let lbl_style = if hit { Style::new().fg(HIT).add_modifier(Modifier::BOLD) } else { Style::new().fg(DIM) };
             let bar_style = if hit { Style::new().fg(HIT) } else if lo < *blank { Style::new().fg(DIM) } else { Style::new().fg(BAR) };
-            let mut spans = vec![Span::styled(label, lbl_style), Span::styled("▏", Style::new().fg(DIM)), Span::styled("█".repeat(len.min(bar_w)), bar_style)];
+            let mut spans = vec![Span::styled(label, lbl_style), Span::styled("┤", Style::new().fg(LINE)), Span::styled("█".repeat(len.min(bar_w)), bar_style)];
             if hit {
                 spans.push(Span::styled(" ◀", Style::new().fg(HIT).add_modifier(Modifier::BOLD)));
             }
@@ -554,6 +582,7 @@ fn draw_levels_popup(f: &mut Frame, area: Rect, spk: u32, mic: u32) {
         Line::raw(""),
         Line::from(Span::styled("[y] yes    [n] keep mine    [Esc] cancel", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))).alignment(Alignment::Center),
     ])
-    .block(Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(ACCENT)).title(" audio levels "));
+    .style(Style::new().bg(PANEL))
+    .block(Block::bordered().border_type(BorderType::Plain).border_style(Style::new().fg(LINE)).title(" AUDIO LEVELS "));
     f.render_widget(p, r);
 }

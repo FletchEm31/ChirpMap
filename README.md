@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" alt="ChirpMap" width="640"></p>
+
 # ChirpMap
 
 Terminal-native acoustic echolocation that maps rooms like an architect's blueprint, using any speaker and mic. Fully offline. Written in Rust.

@@ -28,7 +28,7 @@ Then from any terminal, just type:
 chirpmap
 ```
 
-That opens the launcher: live tracker, live echoes, calibrate, scan, hardware panel, simulator demo, and **update** (pulls the latest code and reinstalls). Ctrl+C in a live view returns to the menu. Scans from the menu are saved to `~/chirpmap-scans/`.
+That opens the ChirpMap window: a full-screen app in your terminal showing the speaker and mic in use, calibration health, an arrow-key menu, and the live tracker drawn right inside it. (Pipe or script it and you get a plain text menu instead; `CHIRPMAP_PLAIN=1` forces that.) The menu has: live tracker, live echoes, calibrate, scan, hardware panel, simulator demo, and **update** (pulls the latest code and reinstalls). Ctrl+C in a live view returns to the menu. Scans from the menu are saved to `~/chirpmap-scans/`.
 
 Every feature is also a direct command (`chirpmap ping --live --diff`, `chirpmap calibrate`, …). See `chirpmap --help`.
 

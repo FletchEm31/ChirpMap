@@ -7,6 +7,7 @@ mod dsp;
 mod levels;
 mod map;
 mod render;
+mod tui;
 
 use anyhow::{bail, Context, Result};
 use audio::{CpalSonar, SimSonar, Sonar};
@@ -264,6 +265,8 @@ fn main() -> Result<()> {
     levels::recover_after_crash();
     match cli.cmd {
         Some(cmd) => run(cmd),
+        // Full-screen window when we're on a real terminal; plain menu otherwise (pipes, scripts).
+        None if std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("CHIRPMAP_PLAIN").is_none() => tui::run(),
         None => menu(),
     }
 }
@@ -272,24 +275,34 @@ fn scans_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("chirpmap-scans")
 }
 
-fn status_line() -> String {
-    let mut out = audio::in_use_block(None, None);
+/// One-line calibration health, and whether it's good.
+fn calib_summary() -> (String, bool) {
     match CpalSonar::open(None, None) {
-        Err(e) => out += &format!("  ⚠  audio not available ({e:#})\n     → try 6 (simulator)\n"),
+        Err(e) => (format!("audio not available ({e:#})"), false),
         Ok(s) => match calib::load(&s.name()) {
-            None => out += "  📐 CALIBRATION  none yet → pick 3 first\n",
-            Some(p) if calib::problems(&p).is_empty() => {
-                out += &format!(
-                    "  📐 CALIBRATION  {:.1}–{:.1} kHz · {:.0} dB SNR · blank {}\n",
+            None => ("none yet — run Calibrate first".into(), false),
+            Some(p) if calib::problems(&p).is_empty() => (
+                format!(
+                    "{:.1}–{:.1} kHz · {:.0} dB SNR · blank {}{}",
                     p.f0 / 1000.0,
                     p.f1 / 1000.0,
                     p.direct_snr_db,
-                    dsp::fmt_len(p.blank_m)
-                );
-            }
-            Some(_) => out += "  📐 CALIBRATION  looks weak → recalibrate (3)\n",
+                    dsp::fmt_len(p.blank_m),
+                    match (p.speaker_pct, p.mic_pct) {
+                        (Some(a), Some(b)) => format!(" · levels spk {a}% mic {b}%"),
+                        _ => String::new(),
+                    }
+                ),
+                true,
+            ),
+            Some(_) => ("looks weak — recalibrate".into(), false),
         },
     }
+}
+
+fn status_line() -> String {
+    let mut out = audio::in_use_block(None, None);
+    out += &format!("  📐 CALIBRATION  {}\n", calib_summary().0);
     out
 }
 

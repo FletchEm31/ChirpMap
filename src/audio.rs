@@ -128,12 +128,11 @@ pub fn system_defaults() -> Option<(Endpoint, Endpoint)> {
     Some((describe_endpoint("sinks", &sink), describe_endpoint("sources", &source)))
 }
 
-/// Human-readable "SPEAKER / MIC" block for whatever ChirpMap will use.
-pub fn in_use_block(output: Option<&str>, input: Option<&str>) -> String {
+/// (speaker, mic, problem-with-mic) for what ChirpMap will use.
+pub fn in_use(output: Option<&str>, input: Option<&str>) -> (String, String, Option<&'static str>) {
     let routed = |sel: Option<&str>| sel.map_or(true, |s| s == "default" || s == "pipewire" || s == "pulse");
     let defaults = system_defaults();
-    let mut out = String::new();
-    let (spk, mic_name, mic_warn) = match (&defaults, routed(output), routed(input)) {
+    match (&defaults, routed(output), routed(input)) {
         (Some((sink, source)), true, true) => (
             format!("{}   (system default)", sink.description),
             format!("{}   (system default)", source.description),
@@ -154,7 +153,13 @@ pub fn in_use_block(output: Option<&str>, input: Option<&str>) -> String {
             };
             (spk, mic, warn)
         }
-    };
+    }
+}
+
+/// Human-readable "SPEAKER / MIC" block for whatever ChirpMap will use.
+pub fn in_use_block(output: Option<&str>, input: Option<&str>) -> String {
+    let (spk, mic_name, mic_warn) = in_use(output, input);
+    let mut out = String::new();
     out += &format!("  🔊 SPEAKER  {spk}\n");
     out += &format!("  🎤 MIC      {mic_name}\n");
     if let Some(w) = mic_warn {

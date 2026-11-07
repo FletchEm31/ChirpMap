@@ -1,6 +1,6 @@
 [package]
 name = "chirpmap"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Terminal-native acoustic echolocation that maps rooms like an architect's blueprint, using any speaker and mic. Fully offline."
 repository = "https://github.com/FletchEm31/ChripMap"
@@ -13,6 +13,7 @@ cpal = "0.15.3"
 ctrlc = "3.4.4"
 dirs = "5.0.1"
 libc = "0.2.155"
+ratatui = "0.29.0"
 rustfft = "6.2.0"
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.117"

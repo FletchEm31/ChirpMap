@@ -1,19 +1,18 @@
 <p align="center"><img src="docs/logo.svg" alt="ChirpMap" width="640"></p>
 
 
-
-# 📡 ChirpMap 
-## Acoustic room mapping, measured by sound
 ---
-
+<h1>📡 ChirpMap <kbd>|</kbd> <sub>Acoustic Room Mapping, Measured by Sound</sub></h1>
 
 
 Terminal-native acoustic echolocation that maps rooms like blueprint - monitors changes, movement and activity, using any speaker and mic. Fully offline. Written in Rust.  Efficiency and accuracy results vary greatly depending on device microphone and speaker equality and ability along with room setup.  Future versions will allow multi speaker, microphone, and device setup and array.
 
 ChirpMap plays a short frequency sweep (a *chirp*) through your speaker, records the mic at the same time, and matched-filters the recording to find echoes. Rotate the device through a few headings and it builds a floor plan in your terminal, plus an SVG blueprint with dimensions and a title block.
 
+---
 ***Notice: ChirpMap is experimental software provided "as-is" and under active development starting on 11-7-2026.  Because performance, accuracy, and acoustic results depend heavily on individual hardware capabilities and room enviroment, the authors assume no liability for hardware performance, audio adjustments, or measurement accuracy. User assumes any and all risk.***
 
+---
 ---
 
 ## Set Up 

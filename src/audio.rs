@@ -80,6 +80,89 @@ pub fn write_wav(path: &std::path::Path, fs: u32, x: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// A real device behind PipeWire/PulseAudio's "default".
+#[derive(Clone, Debug)]
+pub struct Endpoint {
+    pub id: String,
+    pub description: String,
+}
+
+impl Endpoint {
+    /// Plain-English problem with using this as a microphone, if any.
+    pub fn mic_warning(&self) -> Option<&'static str> {
+        if self.id.ends_with(".monitor") {
+            Some("this is a speaker MONITOR (loopback), not a microphone")
+        } else if self.id.contains("iec958") {
+            Some("this is an S/PDIF digital input, not a microphone")
+        } else {
+            None
+        }
+    }
+}
+
+fn pactl(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("pactl").args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn describe_endpoint(kind: &str, id: &str) -> Endpoint {
+    let listing = pactl(&["list", kind]).unwrap_or_default();
+    let mut current: Option<&str> = None;
+    for line in listing.lines() {
+        let l = line.trim();
+        if let Some(n) = l.strip_prefix("Name: ") {
+            current = Some(n);
+        } else if let Some(d) = l.strip_prefix("Description: ") {
+            if current == Some(id) {
+                return Endpoint { id: id.to_string(), description: d.to_string() };
+            }
+        }
+    }
+    Endpoint { id: id.to_string(), description: id.to_string() }
+}
+
+/// The speaker and mic the system "default" device actually routes to (Linux, via pactl).
+pub fn system_defaults() -> Option<(Endpoint, Endpoint)> {
+    let sink = pactl(&["get-default-sink"])?;
+    let source = pactl(&["get-default-source"])?;
+    Some((describe_endpoint("sinks", &sink), describe_endpoint("sources", &source)))
+}
+
+/// Human-readable "SPEAKER / MIC" block for whatever ChirpMap will use.
+pub fn in_use_block(output: Option<&str>, input: Option<&str>) -> String {
+    let routed = |sel: Option<&str>| sel.map_or(true, |s| s == "default" || s == "pipewire" || s == "pulse");
+    let defaults = system_defaults();
+    let mut out = String::new();
+    let (spk, mic_name, mic_warn) = match (&defaults, routed(output), routed(input)) {
+        (Some((sink, source)), true, true) => (
+            format!("{}   (system default)", sink.description),
+            format!("{}   (system default)", source.description),
+            source.mic_warning(),
+        ),
+        _ => {
+            let (o, i) = match CpalSonar::open(output, input) {
+                Ok(s) => (dev_name(&s.out), dev_name(&s.inp)),
+                Err(_) => ("unavailable".into(), "unavailable".into()),
+            };
+            let spk = match (&defaults, routed(output)) {
+                (Some((sink, _)), true) => format!("{}   (system default)", sink.description),
+                _ => o,
+            };
+            let (mic, warn) = match (&defaults, routed(input)) {
+                (Some((_, source)), true) => (format!("{}   (system default)", source.description), source.mic_warning()),
+                _ => (i, None),
+            };
+            (spk, mic, warn)
+        }
+    };
+    out += &format!("  🔊 SPEAKER  {spk}\n");
+    out += &format!("  🎤 MIC      {mic_name}\n");
+    if let Some(w) = mic_warn {
+        out += &format!("  ⚠  {w} — fix: pactl list short sources, then pactl set-default-source <your mic>\n");
+    }
+    out
+}
+
 pub fn dev_name(d: &Device) -> String {
     d.name().unwrap_or_else(|_| "<unnamed>".into())
 }
@@ -465,6 +548,9 @@ fn hardware_panel_inner() -> Result<String> {
     let din = host.default_input_device().map(|d| dev_name(&d));
     let mut s = String::new();
     s += &format!("CHIRPMAP · HARDWARE PANEL   (audio host: {})\n\n", host.id().name());
+    s += "IN USE\n";
+    s += &in_use_block(None, None);
+    s += "\n";
 
     s += "SPEAKERS (use with --output <# or name>)\n";
     let mut best_fs = 0;

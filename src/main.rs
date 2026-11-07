@@ -219,31 +219,24 @@ fn scans_dir() -> PathBuf {
 }
 
 fn status_line() -> String {
+    let mut out = audio::in_use_block(None, None);
     match CpalSonar::open(None, None) {
-        Err(e) => format!("  audio: not available ({e:#})\n  → try 6 (simulator) or check `pactl get-default-source`"),
-        Ok(s) => {
-            let name = s.name();
-            let mut out = format!("  audio: {name}");
-            match calib::load(&name) {
-                None => out += "\n  calibration: none yet → pick 3 first",
-                Some(p) => {
-                    let issues = calib::problems(&p);
-                    if issues.is_empty() {
-                        out += &format!(
-                            "\n  calibration: {:.1}–{:.1} kHz · {:.0} dB SNR · blank {}",
-                            p.f0 / 1000.0,
-                            p.f1 / 1000.0,
-                            p.direct_snr_db,
-                            dsp::fmt_len(p.blank_m)
-                        );
-                    } else {
-                        out += "\n  calibration: looks weak → recalibrate (3)";
-                    }
-                }
+        Err(e) => out += &format!("  ⚠  audio not available ({e:#})\n     → try 6 (simulator)\n"),
+        Ok(s) => match calib::load(&s.name()) {
+            None => out += "  📐 CALIBRATION  none yet → pick 3 first\n",
+            Some(p) if calib::problems(&p).is_empty() => {
+                out += &format!(
+                    "  📐 CALIBRATION  {:.1}–{:.1} kHz · {:.0} dB SNR · blank {}\n",
+                    p.f0 / 1000.0,
+                    p.f1 / 1000.0,
+                    p.direct_snr_db,
+                    dsp::fmt_len(p.blank_m)
+                );
             }
-            out
-        }
+            Some(_) => out += "  📐 CALIBRATION  looks weak → recalibrate (3)\n",
+        },
     }
+    out
 }
 
 /// What `chirpmap` with no arguments does: a launcher menu.
@@ -255,7 +248,7 @@ fn menu() -> Result<()> {
         println!("╔══════════════════════════════════════════════╗");
         println!("║  CHIRPMAP v{:<8}  acoustic room mapping     ║", env!("CARGO_PKG_VERSION"));
         println!("╚══════════════════════════════════════════════╝");
-        println!("{}\n", status_line());
+        println!("{}", status_line());
         println!("  1  Live tracker      shows only what moves (Enter = this)");
         println!("  2  Live echoes       everything the mic hears");
         println!("  3  Calibrate         tune to this speaker + mic");
@@ -302,6 +295,9 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::Devices => print!("{}", audio::hardware_panel()?),
 
         Cmd::Calibrate { dev, force } => {
+            if !dev.sim {
+                print!("{}", audio::in_use_block(dev.output.as_deref(), dev.input.as_deref()));
+            }
             let mut sonar = open(&dev)?;
             let p = calib::run(sonar.as_mut())?;
             let issues = calib::problems(&p);

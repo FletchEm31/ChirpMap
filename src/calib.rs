@@ -24,6 +24,11 @@ pub struct Profile {
     pub direct_snr_db: f32,
     #[serde(default)]
     pub noise_rms: f32,
+    /// System speaker volume / mic sensitivity chosen by `calibrate` (if allowed).
+    #[serde(default)]
+    pub speaker_pct: Option<u32>,
+    #[serde(default)]
+    pub mic_pct: Option<u32>,
     pub latency_jitter_ms: f32,
     /// (band start Hz, SNR dB) for each 1 kHz band probed.
     pub band_snr: Vec<(f32, f32)>,
@@ -44,6 +49,8 @@ impl Profile {
             noise_env: 0.0,
             direct_snr_db: 0.0,
             noise_rms: 0.0,
+            speaker_pct: None,
+            mic_pct: None,
             latency_jitter_ms: 0.0,
             band_snr: Vec::new(),
             created_unix: 0,
@@ -138,7 +145,15 @@ fn peak_abs(x: &[f32]) -> f32 {
 }
 
 /// Run the full calibration and return the profile (caller saves it).
-pub fn run(sonar: &mut dyn Sonar) -> Result<Profile> {
+/// `levels`: when the user allowed it, the session that may change system
+/// volume/mic gain, and the maximum speaker volume (%) they set.
+pub fn run(sonar: &mut dyn Sonar, levels: Option<(&crate::levels::Session, u32)>) -> Result<Profile> {
+    let total = if levels.is_some() { 5 } else { 4 };
+    let mut step = 0;
+    let mut next = || {
+        step += 1;
+        format!("[{step}/{total}]")
+    };
     let mut p = Profile::defaults(sonar);
     let fs = p.fs;
     let listen = 0.06;
@@ -147,14 +162,14 @@ pub fn run(sonar: &mut dyn Sonar) -> Result<Profile> {
     println!("Keep the room quiet and the device still.\n");
 
     // 1. Room noise
-    println!("[1/4] Listening to room noise (1 s)…");
-    let noise = sonar.record(1.0)?;
+    println!("{} Listening to room noise (1 s)…", next());
+    let mut noise = sonar.record(1.0)?;
     let noise_rms = (noise.iter().map(|x| x * x).sum::<f32>() / noise.len() as f32).sqrt();
     println!("      noise RMS {:.5}", noise_rms);
     p.noise_rms = noise_rms;
 
     // 2. Frequency response probe: wide chirp, compare to noise per 1 kHz band
-    println!("[2/4] Probing speaker/mic frequency response…");
+    println!("{} Probing speaker/mic frequency response…", next());
     let top = (0.45 * fs as f32).min(20_000.0);
     let probe = chirp(fs, 0.02, 1000.0, top);
     let rec = sonar.playrec(&probe, listen, 0.6)?;
@@ -177,9 +192,69 @@ pub fn run(sonar: &mut dyn Sonar) -> Result<Profile> {
         ),
     }
 
-    // 3. Volume: quietest level that clears 35 dB SNR without clipping
-    println!("[3/4] Setting volume…");
     let tpl = p.template();
+
+    // 3 (optional). System levels: try mic sensitivity × speaker volume, keep the
+    // combination with the best signal-to-noise that doesn't clip.
+    if let Some((sess, cap)) = levels {
+        println!(
+            "{} Tuning system levels (speaker max {cap}%; yours were speaker {}%, mic {}%)…",
+            next(),
+            sess.original.0,
+            sess.original.1
+        );
+        let spk_steps: Vec<u32> = {
+            let mut v: Vec<u32> = [cap / 2, cap * 3 / 4, cap].into_iter().map(|x| x.max(5)).collect();
+            v.dedup();
+            v
+        };
+        let mut best: Option<(u32, u32, f32)> = None;
+        for mic in [50u32, 70, 85, 100] {
+            sess.set_mic(mic);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let n = sonar.record(0.4)?;
+            let n_env = percentile(&matched_envelope(&n, &tpl), 0.95).max(1e-9);
+            for &spk in &spk_steps {
+                sess.set_speaker(spk);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let rec = sonar.playrec(&tpl, listen, 0.7)?;
+                let clip = peak_abs(&rec) > 0.95;
+                let direct = matched_envelope(&rec, &tpl).iter().cloned().fold(0.0, f32::max);
+                let snr = 20.0 * (direct / n_env).log10();
+                println!(
+                    "      mic {mic:>3}% · speaker {spk:>3}%: SNR {snr:5.1} dB{}",
+                    if clip { "  (clipping)" } else { "" }
+                );
+                if clip {
+                    continue;
+                }
+                // Prefer quieter settings unless louder is clearly (>1 dB) better.
+                let better = match best {
+                    None => true,
+                    Some((_, _, b)) => snr > b + 1.0,
+                };
+                if better {
+                    best = Some((spk, mic, snr));
+                }
+            }
+        }
+        match best {
+            Some((spk, mic, snr)) => {
+                sess.set_speaker(spk);
+                sess.set_mic(mic);
+                p.speaker_pct = Some(spk);
+                p.mic_pct = Some(mic);
+                println!("      → speaker {spk}%, mic {mic}% ({snr:.0} dB)");
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                noise = sonar.record(1.0)?;
+                p.noise_rms = (noise.iter().map(|x| x * x).sum::<f32>() / noise.len() as f32).sqrt();
+            }
+            None => println!("      every combination clipped — keeping your levels"),
+        }
+    }
+
+    // Volume: quietest chirp level that clears 35 dB SNR without clipping
+    println!("{} Setting chirp volume…", next());
     let nenv = matched_envelope(&noise, &tpl);
     p.noise_env = percentile(&nenv, 0.95);
     let mut chosen: Option<(f32, f32)> = None;
@@ -205,7 +280,7 @@ pub fn run(sonar: &mut dyn Sonar) -> Result<Profile> {
     println!("      → volume {vol:.1} ({snr:.0} dB)");
 
     // 4. Ring-down and latency jitter
-    println!("[4/4] Measuring speaker ring-down and latency jitter…");
+    println!("{} Measuring speaker ring-down and latency jitter…", next());
     let envs: Result<Vec<Vec<f32>>> = (0..6)
         .map(|_| sonar.playrec(&tpl, listen, p.volume).map(|r| matched_envelope(&r, &tpl)))
         .collect();

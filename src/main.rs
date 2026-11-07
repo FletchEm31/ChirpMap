@@ -4,6 +4,7 @@
 mod audio;
 mod calib;
 mod dsp;
+mod levels;
 mod map;
 mod render;
 
@@ -191,6 +192,57 @@ fn read_line(prompt: &str) -> Result<String> {
     Ok(s.trim().to_string())
 }
 
+fn ask_yes(prompt: &str) -> Result<bool> {
+    let a = read_line(prompt)?.to_lowercase();
+    Ok(a.is_empty() || a.starts_with('y'))
+}
+
+/// Ask permission (and a speaker ceiling) before touching system levels.
+fn ask_levels_for_calibration() -> Result<Option<(levels::Session, u32)>> {
+    if !levels::available() {
+        return Ok(None);
+    }
+    println!();
+    if !ask_yes("Allow ChirpMap to adjust your speaker volume and mic sensitivity while it calibrates?\nYour current levels are saved and put back when it finishes. [Y/n] ")? {
+        println!("OK — leaving your levels alone.\n");
+        return Ok(None);
+    }
+    let cur = levels::current_speaker_pct().unwrap_or(0);
+    let cap = loop {
+        let a = read_line(&format!(
+            "Highest speaker volume ChirpMap may use, 10–100% (yours is {cur}% now) [60]: "
+        ))?;
+        if a.is_empty() {
+            break 60;
+        }
+        match a.trim_end_matches('%').trim().parse::<u32>() {
+            Ok(v) if (10..=100).contains(&v) => break v,
+            _ => println!("  enter a number from 10 to 100"),
+        }
+    };
+    println!();
+    Ok(levels::Session::begin().map(|s| (s, cap)))
+}
+
+/// If calibration saved levels, offer to use them for this run (restored afterwards).
+fn ask_levels_for_run(p: &Profile, sim: bool) -> Result<Option<levels::Session>> {
+    let (Some(spk), Some(mic)) = (p.speaker_pct, p.mic_pct) else { return Ok(None) };
+    if sim || !levels::available() {
+        return Ok(None);
+    }
+    if !ask_yes(&format!(
+        "Use your calibrated levels (speaker {spk}%, mic {mic}%)? They're put back when you stop. [Y/n] "
+    ))? {
+        return Ok(None);
+    }
+    let sess = levels::Session::begin();
+    if let Some(s) = &sess {
+        s.set_speaker(spk);
+        s.set_mic(mic);
+    }
+    Ok(sess)
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -204,10 +256,12 @@ fn main() -> Result<()> {
         if IN_LIVE.load(Ordering::SeqCst) {
             STOP.store(true, Ordering::SeqCst);
         } else {
+            levels::restore_active();
             println!();
             std::process::exit(130);
         }
     });
+    levels::recover_after_crash();
     match cli.cmd {
         Some(cmd) => run(cmd),
         None => menu(),
@@ -299,7 +353,10 @@ fn run(cmd: Cmd) -> Result<()> {
                 print!("{}", audio::in_use_block(dev.output.as_deref(), dev.input.as_deref()));
             }
             let mut sonar = open(&dev)?;
-            let p = calib::run(sonar.as_mut())?;
+            let session = if dev.sim { None } else { ask_levels_for_calibration()? };
+            let result = calib::run(sonar.as_mut(), session.as_ref().map(|(s, cap)| (s, *cap)));
+            drop(session); // puts your levels back, success or failure
+            let p = result?;
             let issues = calib::problems(&p);
             if !issues.is_empty() {
                 println!("\n⚠  Calibration looks bad:");
@@ -323,6 +380,7 @@ fn run(cmd: Cmd) -> Result<()> {
             if let Some(b) = blank {
                 p.blank_m = b;
             }
+            let _levels = ask_levels_for_run(&p, dev.sim)?;
             let tpl = p.template();
             let bg = if diff {
                 println!("Capturing the empty scene — keep still and out of the way for a few seconds…");
@@ -386,6 +444,7 @@ fn run(cmd: Cmd) -> Result<()> {
             if let Some(b) = blank {
                 p.blank_m = b;
             }
+            let _levels = ask_levels_for_run(&p, dev.sim)?;
             let tpl = p.template();
             let auto = auto || sonar.is_sim();
             let mut planned = match positions {

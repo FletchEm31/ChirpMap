@@ -58,7 +58,10 @@ Every command takes `--output <# or name>` and `--input <# or name>` to choose d
 1. **Noise floor:** listens to the room for 1 s.
 2. **Frequency band:** sweeps 1 kHz up to 20 kHz and keeps the widest band at least 10 dB above the noise (cheap laptop speakers often lose the top end).
 3. **Volume:** the quietest level that reaches 35 dB SNR without clipping the mic.
-4. **Ring-down and latency:** measures how long the speaker keeps ringing (that sets the blanking distance, since nothing closer can be seen) and how much the driver latency jitters. Every ping is aligned on its own direct speaker-to-mic arrival, so latency doesn't affect distances.
+4. **System levels (optional, asks first):** with your permission, and only up to a maximum speaker volume *you* choose, it tries mic sensitivity × speaker volume combinations and keeps the best one that doesn't clip.
+5. **Ring-down and latency:** measures how long the speaker keeps ringing (that sets the blanking distance, since nothing closer can be seen) and how much the driver latency jitters. Every ping is aligned on its own direct speaker-to-mic arrival, so latency doesn't affect distances.
+
+**Your levels always come back.** Before changing anything, ChirpMap saves your exact speaker and mic volumes (per channel) and mute states, and writes them to `~/.config/chirpmap/restore-levels.json`. They're restored when it finishes, on an error, on Ctrl+C, and even after a crash or power cut (the next `chirpmap` start restores them). Later `ping` and `scan` runs offer to use the calibrated levels and put yours back when you stop.
 
 If the mic is digitally silent (wrong input, such as a `.monitor` or S/PDIF `iec958` source) or barely hears the speaker (under 20 dB SNR), calibration says why and **doesn't save** the profile. Add `--force` to save it anyway.
 

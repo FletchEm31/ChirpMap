@@ -19,9 +19,18 @@ ChirpMap plays a short frequency sweep (a *chirp*) through your speaker, records
 sudo apt install libasound2-dev pkg-config     # Debian/Ubuntu
 sudo dnf install alsa-lib-devel                # Fedora
 
-cargo build --release
-./target/release/chirpmap --help
+cargo install --path .      # puts `chirpmap` on your PATH (~/.cargo/bin)
 ```
+
+Then from any terminal, just type:
+
+```bash
+chirpmap
+```
+
+That opens the launcher: live tracker, live echoes, calibrate, scan, hardware panel, simulator demo, and **update** (pulls the latest code and reinstalls). Ctrl+C in a live view returns to the menu. Scans from the menu are saved to `~/chirpmap-scans/`.
+
+Every feature is also a direct command (`chirpmap ping --live --diff`, `chirpmap calibrate`, …). See `chirpmap --help`.
 
 No network access is used at any point.
 

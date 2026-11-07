@@ -15,6 +15,7 @@ use dsp::{Echo, RangeProfile};
 use map::{Observation, ScanMap};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Parser)]
 #[command(
@@ -23,11 +24,16 @@ use std::path::PathBuf;
     about = "Terminal-native acoustic echolocation that maps rooms like an architect's blueprint. Fully offline."
 )]
 struct Cli {
+    /// Leave out to open the launcher menu
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
-#[derive(Args, Clone)]
+/// Ctrl+C inside a live view returns to the menu instead of killing the program.
+static IN_LIVE: AtomicBool = AtomicBool::new(false);
+static STOP: AtomicBool = AtomicBool::new(false);
+
+#[derive(Args, Clone, Default)]
 struct DevArgs {
     /// Speaker: index or part of the name from `chirpmap devices` (default: system default)
     #[arg(long)]
@@ -194,7 +200,105 @@ fn now() -> u64 {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let _ = ctrlc::set_handler(|| {
+        if IN_LIVE.load(Ordering::SeqCst) {
+            STOP.store(true, Ordering::SeqCst);
+        } else {
+            println!();
+            std::process::exit(130);
+        }
+    });
     match cli.cmd {
+        Some(cmd) => run(cmd),
+        None => menu(),
+    }
+}
+
+fn scans_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("chirpmap-scans")
+}
+
+fn status_line() -> String {
+    match CpalSonar::open(None, None) {
+        Err(e) => format!("  audio: not available ({e:#})\n  → try 6 (simulator) or check `pactl get-default-source`"),
+        Ok(s) => {
+            let name = s.name();
+            let mut out = format!("  audio: {name}");
+            match calib::load(&name) {
+                None => out += "\n  calibration: none yet → pick 3 first",
+                Some(p) => {
+                    let issues = calib::problems(&p);
+                    if issues.is_empty() {
+                        out += &format!(
+                            "\n  calibration: {:.1}–{:.1} kHz · {:.0} dB SNR · blank {}",
+                            p.f0 / 1000.0,
+                            p.f1 / 1000.0,
+                            p.direct_snr_db,
+                            dsp::fmt_len(p.blank_m)
+                        );
+                    } else {
+                        out += "\n  calibration: looks weak → recalibrate (3)";
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+/// What `chirpmap` with no arguments does: a launcher menu.
+fn menu() -> Result<()> {
+    let dev = DevArgs::default();
+    let sim = DevArgs { sim: true, ..DevArgs::default() };
+    loop {
+        print!("\x1b[H\x1b[J");
+        println!("╔══════════════════════════════════════════════╗");
+        println!("║  CHIRPMAP v{:<8}  acoustic room mapping     ║", env!("CARGO_PKG_VERSION"));
+        println!("╚══════════════════════════════════════════════╝");
+        println!("{}\n", status_line());
+        println!("  1  Live tracker      shows only what moves (Enter = this)");
+        println!("  2  Live echoes       everything the mic hears");
+        println!("  3  Calibrate         tune to this speaker + mic");
+        println!("  4  Scan a room       rotate-and-ping floor plan");
+        println!("  5  Hardware panel    speakers, mics, profiles");
+        println!("  6  Simulator demo    scan a fake room, no hardware");
+        println!("  u  Update            git pull + reinstall");
+        println!("  q  Quit\n");
+        println!("  (Ctrl+C in a live view comes back here)");
+        let choice = read_line("\n> ")?;
+        let cmd = match choice.to_lowercase().as_str() {
+            "1" | "" => Cmd::Ping { dev: dev.clone(), live: true, avg: 4, max_range: 4.0, bin: 0.1, diff: true, blank: None, dump: None },
+            "2" => Cmd::Ping { dev: dev.clone(), live: true, avg: 4, max_range: 4.0, bin: 0.1, diff: false, blank: None, dump: None },
+            "3" => Cmd::Calibrate { dev: dev.clone(), force: false },
+            "4" => Cmd::Scan { dev: dev.clone(), steps: 8, beam: 30.0, avg: 4, max_range: 5.0, cell: 0.1, blank: None, positions: None, auto: false, out: scans_dir(), no_color: false },
+            "5" => Cmd::Devices,
+            "6" => Cmd::Scan { dev: sim.clone(), steps: 8, beam: 30.0, avg: 4, max_range: 5.0, cell: 0.1, blank: None, positions: None, auto: true, out: scans_dir(), no_color: false },
+            "u" => {
+                update();
+                read_line("\nPress Enter, then restart chirpmap to use the new version…")?;
+                return Ok(());
+            }
+            "q" | "quit" | "exit" => return Ok(()),
+            _ => continue,
+        };
+        if let Err(e) = run(cmd) {
+            println!("\nerror: {e:#}");
+        }
+        read_line("\nPress Enter for the menu…")?;
+    }
+}
+
+/// Pull the latest code into the source folder this binary was built from and reinstall.
+fn update() {
+    let src = env!("CARGO_MANIFEST_DIR");
+    println!("Updating from {src} …");
+    let ok = std::process::Command::new("git").args(["-C", src, "pull", "--ff-only"]).status().map(|s| s.success()).unwrap_or(false)
+        && std::process::Command::new("cargo").args(["install", "--path", src, "--force"]).status().map(|s| s.success()).unwrap_or(false);
+    println!("{}", if ok { "Updated." } else { "Update failed — see messages above." });
+}
+
+fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::Devices => print!("{}", audio::hardware_panel()?),
 
         Cmd::Calibrate { dev, force } => {
@@ -236,7 +340,13 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+            IN_LIVE.store(live, Ordering::SeqCst);
+            STOP.store(false, Ordering::SeqCst);
+            let result = (|| -> Result<()> {
             loop {
+                if STOP.load(Ordering::SeqCst) {
+                    break;
+                }
                 let (rp, raw) = measure_profile(sonar.as_mut(), &p, &tpl, avg, max_range)?;
                 if let Some(path) = &dump {
                     audio::write_wav(path, p.fs, &raw)?;
@@ -261,13 +371,17 @@ fn main() -> Result<()> {
                 );
                 let out = render::bars(&shown, &echoes, max_range, bin, p.blank_m, floor, &header);
                 if live {
-                    print!("\x1b[H\x1b[J{out}\n(Ctrl+C to quit)\n");
+                    print!("\x1b[H\x1b[J{out}\n(Ctrl+C to stop)\n");
                     std::io::stdout().flush()?;
                 } else {
                     print!("{out}");
                     break;
                 }
             }
+            Ok(())
+            })();
+            IN_LIVE.store(false, Ordering::SeqCst);
+            result?;
         }
 
         Cmd::Scan { dev, steps, beam, avg, max_range, cell, blank, positions, auto, out, no_color } => {

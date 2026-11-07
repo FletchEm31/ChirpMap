@@ -26,6 +26,60 @@ pub trait Sonar {
     }
 }
 
+/// Run `f` with stderr pointed at /dev/null. ALSA prints dozens of harmless
+/// "unable to open slave" lines while probing virtual devices; this hides them.
+/// Set CHIRPMAP_ALSA_DEBUG=1 to see them.
+#[cfg(unix)]
+pub fn quiet<R>(f: impl FnOnce() -> R) -> R {
+    if std::env::var_os("CHIRPMAP_ALSA_DEBUG").is_some() {
+        return f();
+    }
+    // SAFETY: plain fd juggling on stderr; restored before returning.
+    unsafe {
+        let devnull = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY);
+        if devnull < 0 {
+            return f();
+        }
+        let saved = libc::dup(2);
+        libc::dup2(devnull, 2);
+        libc::close(devnull);
+        let r = f();
+        if saved >= 0 {
+            libc::dup2(saved, 2);
+            libc::close(saved);
+        }
+        r
+    }
+}
+
+#[cfg(not(unix))]
+pub fn quiet<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// Save mono samples as a 32-bit float WAV (for inspecting what the mic heard).
+pub fn write_wav(path: &std::path::Path, fs: u32, x: &[f32]) -> Result<()> {
+    let data_len = (x.len() * 4) as u32;
+    let mut b: Vec<u8> = Vec::with_capacity(44 + x.len() * 4);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data_len).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+    b.extend_from_slice(&1u16.to_le_bytes()); // mono
+    b.extend_from_slice(&fs.to_le_bytes());
+    b.extend_from_slice(&(fs * 4).to_le_bytes());
+    b.extend_from_slice(&4u16.to_le_bytes());
+    b.extend_from_slice(&32u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data_len.to_le_bytes());
+    for v in x {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, b)?;
+    Ok(())
+}
+
 pub fn dev_name(d: &Device) -> String {
     d.name().unwrap_or_else(|_| "<unnamed>".into())
 }
@@ -63,6 +117,10 @@ pub struct CpalSonar {
 
 impl CpalSonar {
     pub fn open(output: Option<&str>, input: Option<&str>) -> Result<Self> {
+        quiet(|| Self::open_inner(output, input))
+    }
+
+    fn open_inner(output: Option<&str>, input: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
         let out = select(
             host.output_devices()?.collect(),
@@ -210,17 +268,23 @@ impl Sonar for CpalSonar {
         let buf = Arc::new(Mutex::new(Vec::with_capacity(
             (dur * self.in_rate as f32) as usize + 4096,
         )));
-        let ins = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
-        ins.play()?;
+        let ins = quiet(|| -> Result<Stream> {
+            let s = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
+            s.play()?;
+            Ok(s)
+        })?;
         std::thread::sleep(Duration::from_millis(40));
-        let outs = build_output(
-            &self.out,
-            &self.out_cfg,
-            self.out_fmt,
-            Arc::new(play),
-            Arc::new(AtomicUsize::new(0)),
-        )?;
-        outs.play()?;
+        let outs = quiet(|| -> Result<Stream> {
+            let s = build_output(
+                &self.out,
+                &self.out_cfg,
+                self.out_fmt,
+                Arc::new(play),
+                Arc::new(AtomicUsize::new(0)),
+            )?;
+            s.play()?;
+            Ok(s)
+        })?;
         std::thread::sleep(Duration::from_secs_f32(dur));
         drop(outs);
         std::thread::sleep(Duration::from_millis(20));
@@ -238,8 +302,11 @@ impl Sonar for CpalSonar {
 
     fn record(&mut self, secs: f32) -> Result<Vec<f32>> {
         let buf = Arc::new(Mutex::new(Vec::new()));
-        let ins = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
-        ins.play()?;
+        let ins = quiet(|| -> Result<Stream> {
+            let s = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
+            s.play()?;
+            Ok(s)
+        })?;
         std::thread::sleep(Duration::from_secs_f32(secs));
         drop(ins);
         let rec = buf
@@ -389,6 +456,10 @@ fn describe(cfg: Result<cpal::SupportedStreamConfig, cpal::DefaultStreamConfigEr
 
 /// Text panel listing speakers and mics, their formats, and what ChirpMap can do with them.
 pub fn hardware_panel() -> Result<String> {
+    quiet(hardware_panel_inner)
+}
+
+fn hardware_panel_inner() -> Result<String> {
     let host = cpal::default_host();
     let dout = host.default_output_device().map(|d| dev_name(&d));
     let din = host.default_input_device().map(|d| dev_name(&d));

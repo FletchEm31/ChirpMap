@@ -31,9 +31,14 @@ No network access is used at any point.
 |---|---|
 | `chirpmap devices` | **Hardware panel**: every speaker and mic, its sample rate, channels and format, what chirp band and range resolution it supports, and which ones are already calibrated |
 | `chirpmap calibrate` | **Auto-calibration** for the current speaker+mic pair (below). Saves a profile that every later command uses automatically |
-| `chirpmap ping [--live]` | One-direction range reading as a bar chart (the original `echo.py` view) |
+| `chirpmap ping [--live]` | One-direction range reading as a bar chart (the original `echo.py` view), in metres and feet/inches |
+| `chirpmap ping --live --diff` | **Background subtraction**: captures the empty scene first, then shows only what *changed*, so a hand or book is the only thing on screen |
 | `chirpmap scan` | Maps a room: turn the device clockwise through headings (8 × 45° by default), optionally at several spots |
 | `chirpmap render scans/scan-….json [--svg out.svg]` | Redraws a saved scan |
+
+Useful extras: `--blank <m>` overrides the calibrated blanking distance (on `ping` and `scan`), and `ping --dump rec.wav` saves the raw mic recording so you can see exactly what the mic heard (open it in Audacity).
+
+ALSA prints dozens of harmless "unable to open slave" lines while probing devices; ChirpMap hides them. Set `CHIRPMAP_ALSA_DEBUG=1` to see them.
 
 Every command takes `--output <# or name>` and `--input <# or name>` to choose devices (default: the system defaults), and `--sim` to run against a simulated 5.2 × 4.1 m room without any audio hardware.
 
@@ -46,7 +51,21 @@ Every command takes `--output <# or name>` and `--input <# or name>` to choose d
 3. **Volume:** the quietest level that reaches 35 dB SNR without clipping the mic.
 4. **Ring-down and latency:** measures how long the speaker keeps ringing (that sets the blanking distance, since nothing closer can be seen) and how much the driver latency jitters. Every ping is aligned on its own direct speaker-to-mic arrival, so latency doesn't affect distances.
 
+If the mic is digitally silent (wrong input, such as a `.monitor` or S/PDIF `iec958` source) or barely hears the speaker (under 20 dB SNR), calibration says why and **doesn't save** the profile. Add `--force` to save it anyway.
+
 Profiles live in `~/.config/chirpmap/profiles/`.
+
+### Linux: pick the right mic
+
+`chirpmap` uses PipeWire's default input. Check it's a real microphone:
+
+```bash
+pactl get-default-source          # should NOT end in .monitor or be an iec958 input
+pactl list short sources          # find your mic
+pactl set-default-source <name>
+```
+
+Put the mic right next to the speaker, both facing the room (like a bat's mouth and ears).
 
 ## Scanning a room
 

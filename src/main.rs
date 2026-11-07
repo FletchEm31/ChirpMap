@@ -48,6 +48,9 @@ enum Cmd {
     Calibrate {
         #[command(flatten)]
         dev: DevArgs,
+        /// Save the profile even if the quality checks fail
+        #[arg(long)]
+        force: bool,
     },
     /// Single-direction range reading as a bar chart
     Ping {
@@ -65,6 +68,15 @@ enum Cmd {
         /// Metres per bar
         #[arg(long, default_value_t = 0.1)]
         bin: f32,
+        /// Show only what CHANGED vs. the empty scene (captured at start). Makes a hand or book obvious
+        #[arg(long)]
+        diff: bool,
+        /// Override the calibrated blanking distance, metres
+        #[arg(long)]
+        blank: Option<f32>,
+        /// Save each raw mic recording to this .wav (overwritten every reading)
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
     /// Map a room: rotate the device through headings at one or more spots
     Scan {
@@ -85,6 +97,9 @@ enum Cmd {
         /// Map grid size, metres
         #[arg(long, default_value_t = 0.1)]
         cell: f32,
+        /// Override the calibrated blanking distance, metres
+        #[arg(long)]
+        blank: Option<f32>,
         /// Pre-planned spots as "x,y;x,y" in metres from the first spot (skips the prompts between spots)
         #[arg(long)]
         positions: Option<String>,
@@ -128,16 +143,22 @@ fn listen_for(max_range: f32) -> f32 {
     2.0 * max_range / dsp::SPEED_OF_SOUND + 0.05
 }
 
-/// Average `avg` pings and pick echoes.
-fn measure(sonar: &mut dyn Sonar, p: &Profile, tpl: &[f32], avg: usize, max_range: f32) -> Result<(RangeProfile, Vec<Echo>)> {
+/// Average `avg` pings into one range profile. Also returns the last raw recording.
+fn measure_profile(sonar: &mut dyn Sonar, p: &Profile, tpl: &[f32], avg: usize, max_range: f32) -> Result<(RangeProfile, Vec<f32>)> {
     let listen = listen_for(max_range);
     let mut envs = Vec::with_capacity(avg);
+    let mut raw = Vec::new();
     for _ in 0..avg.max(1) {
-        let rec = sonar.playrec(tpl, listen, p.volume)?;
-        envs.push(dsp::matched_envelope(&rec, tpl));
+        raw = sonar.playrec(tpl, listen, p.volume)?;
+        envs.push(dsp::matched_envelope(&raw, tpl));
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
-    let rp = dsp::aligned_average(&envs, p.fs);
+    Ok((dsp::aligned_average(&envs, p.fs), raw))
+}
+
+/// Average `avg` pings and pick echoes.
+fn measure(sonar: &mut dyn Sonar, p: &Profile, tpl: &[f32], avg: usize, max_range: f32) -> Result<(RangeProfile, Vec<Echo>)> {
+    let (rp, _) = measure_profile(sonar, p, tpl, avg, max_range)?;
     let th = dsp::echo_threshold(p.noise_env, rp.direct_peak);
     let echoes = dsp::find_echoes(&rp, p.blank_m, max_range, th);
     Ok((rp, echoes))
@@ -176,10 +197,19 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Devices => print!("{}", audio::hardware_panel()?),
 
-        Cmd::Calibrate { dev } => {
+        Cmd::Calibrate { dev, force } => {
             let mut sonar = open(&dev)?;
             let p = calib::run(sonar.as_mut())?;
-            if sonar.is_sim() {
+            let issues = calib::problems(&p);
+            if !issues.is_empty() {
+                println!("\n⚠  Calibration looks bad:");
+                for i in &issues {
+                    println!("   • {i}");
+                }
+            }
+            if !issues.is_empty() && !force {
+                println!("\nNot saved. Fix the above and rerun, or add --force to save anyway.");
+            } else if sonar.is_sim() {
                 println!("\n(simulated device — profile not saved)");
             } else {
                 let path = calib::save(&p)?;
@@ -187,19 +217,49 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Ping { dev, live, avg, max_range, bin } => {
+        Cmd::Ping { dev, live, avg, max_range, bin, diff, blank, dump } => {
             let mut sonar = open(&dev)?;
-            let p = calib::load_or_default(sonar.as_ref());
+            let mut p = calib::load_or_default(sonar.as_ref());
+            if let Some(b) = blank {
+                p.blank_m = b;
+            }
             let tpl = p.template();
+            let bg = if diff {
+                println!("Capturing the empty scene — keep still and out of the way for a few seconds…");
+                let mut shots = Vec::new();
+                for _ in 0..8 {
+                    shots.push(measure_profile(sonar.as_mut(), &p, &tpl, avg, max_range)?.0);
+                }
+                println!("Background captured. Now move something in front of the mic.");
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                Some(dsp::Background::capture(&shots))
+            } else {
+                None
+            };
             loop {
-                let (rp, echoes) = measure(sonar.as_mut(), &p, &tpl, avg, max_range)?;
+                let (rp, raw) = measure_profile(sonar.as_mut(), &p, &tpl, avg, max_range)?;
+                if let Some(path) = &dump {
+                    audio::write_wav(path, p.fs, &raw)?;
+                }
+                let (shown, th, floor, mode) = match &bg {
+                    Some(b) => {
+                        let d = b.subtract(&rp);
+                        let th = b.threshold(p.fs, p.blank_m, max_range);
+                        (d, th, th * 2.0, "CHANGE vs background")
+                    }
+                    None => {
+                        let th = dsp::echo_threshold(p.noise_env, rp.direct_peak);
+                        (rp, th, 0.0, "Echo strength")
+                    }
+                };
+                let echoes = dsp::find_echoes(&shown, p.blank_m, max_range, th);
                 let header = format!(
-                    "Echo strength vs distance  ({:.1}–{:.1} kHz chirp, avg {avg}, blank {:.2} m)",
+                    "{mode} vs distance  ({:.1}–{:.1} kHz chirp, avg {avg}, blank {})",
                     p.f0 / 1000.0,
                     p.f1 / 1000.0,
-                    p.blank_m
+                    dsp::fmt_len(p.blank_m)
                 );
-                let out = render::bars(&rp, &echoes, max_range, bin, p.blank_m, &header);
+                let out = render::bars(&shown, &echoes, max_range, bin, p.blank_m, floor, &header);
                 if live {
                     print!("\x1b[H\x1b[J{out}\n(Ctrl+C to quit)\n");
                     std::io::stdout().flush()?;
@@ -210,9 +270,12 @@ fn main() -> Result<()> {
             }
         }
 
-        Cmd::Scan { dev, steps, beam, avg, max_range, cell, positions, auto, out, no_color } => {
+        Cmd::Scan { dev, steps, beam, avg, max_range, cell, blank, positions, auto, out, no_color } => {
             let mut sonar = open(&dev)?;
-            let p = calib::load_or_default(sonar.as_ref());
+            let mut p = calib::load_or_default(sonar.as_ref());
+            if let Some(b) = blank {
+                p.blank_m = b;
+            }
             let tpl = p.template();
             let auto = auto || sonar.is_sim();
             let mut planned = match positions {
@@ -249,8 +312,8 @@ fn main() -> Result<()> {
                     sonar.aim(pos, heading);
                     let (_, echoes) = measure(sonar.as_mut(), &p, &tpl, avg, max_range)?;
                     match echoes.first() {
-                        Some(e) => println!("  {heading:>5.1}°  nearest surface {:.2} m ({:.0} dB)", e.dist_m, e.db()),
-                        None => println!("  {heading:>5.1}°  nothing within {max_range:.1} m"),
+                        Some(e) => println!("  {heading:>5.1}°  nearest surface {} ({:.0} dB)", dsp::fmt_len(e.dist_m), e.db()),
+                        None => println!("  {heading:>5.1}°  nothing within {}", dsp::fmt_len(max_range)),
                     }
                     map.observations.push(Observation { pos, heading_deg: heading, echoes, max_range });
                 }

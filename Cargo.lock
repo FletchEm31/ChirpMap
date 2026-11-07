@@ -178,6 +178,7 @@ dependencies = [
  "clap",
  "cpal",
  "dirs",
+ "libc",
  "rustfft",
  "serde",
  "serde_json",

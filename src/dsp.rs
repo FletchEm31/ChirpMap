@@ -65,6 +65,17 @@ pub fn matched_envelope(rec: &[f32], tpl: &[f32]) -> Vec<f32> {
     c[..valid].iter().map(|z| z.norm() / n as f32).collect()
 }
 
+/// "1.23 m (4' 0\")" — metres with feet and inches alongside.
+pub fn fmt_len(m: f32) -> String {
+    format!("{m:.2} m ({})", feet_inches(m))
+}
+
+/// Feet and whole inches, e.g. 4' 0".
+pub fn feet_inches(m: f32) -> String {
+    let total_in = (m.max(0.0) / 0.0254).round() as i64;
+    format!("{}' {}\"", total_in / 12, total_in % 12)
+}
+
 pub fn samples_to_m(i: usize, fs: u32) -> f32 {
     i as f32 / fs as f32 * SPEED_OF_SOUND / 2.0
 }
@@ -121,6 +132,58 @@ pub fn aligned_average(envs: &[Vec<f32>], fs: u32) -> RangeProfile {
         direct_peak: acc.first().copied().unwrap_or(0.0),
         env: acc,
         direct_idx: idx,
+    }
+}
+
+/// The static scene (desk, monitor, walls): per-sample mean and spread of the
+/// echo envelope over several pings. Subtracting it leaves only what changed.
+#[derive(Clone, Debug)]
+pub struct Background {
+    pub mean: Vec<f32>,
+    pub std: Vec<f32>,
+}
+
+impl Background {
+    pub fn capture(profiles: &[RangeProfile]) -> Self {
+        let len = profiles.iter().map(|p| p.env.len()).min().unwrap_or(0);
+        let n = profiles.len().max(1) as f32;
+        let mut mean = vec![0.0f32; len];
+        let mut sq = vec![0.0f32; len];
+        for p in profiles {
+            for i in 0..len {
+                let v = p.env[i] / p.direct_peak.max(1e-12);
+                mean[i] += v;
+                sq[i] += v * v;
+            }
+        }
+        let std = (0..len)
+            .map(|i| {
+                let m = mean[i] / n;
+                (sq[i] / n - m * m).max(0.0).sqrt()
+            })
+            .collect();
+        mean.iter_mut().for_each(|v| *v /= n);
+        Self { mean, std }
+    }
+
+    /// |reading − background|, both normalised to their own direct path
+    /// (so volume drift doesn't show up as change).
+    pub fn subtract(&self, rp: &RangeProfile) -> RangeProfile {
+        let len = self.mean.len().min(rp.env.len());
+        let d = rp.direct_peak.max(1e-12);
+        let env = (0..len).map(|i| (rp.env[i] / d - self.mean[i]).abs()).collect();
+        RangeProfile { fs: rp.fs, env, direct_peak: 1.0, direct_idx: rp.direct_idx.clone() }
+    }
+
+    /// Change threshold over [lo_m, hi_m]: 4× the typical ping-to-ping wobble.
+    pub fn threshold(&self, fs: u32, lo_m: f32, hi_m: f32) -> f32 {
+        let lo = m_to_samples(lo_m, fs).min(self.std.len());
+        let hi = m_to_samples(hi_m, fs).min(self.std.len());
+        if hi <= lo {
+            return 0.01;
+        }
+        let avg = self.std[lo..hi].iter().sum::<f32>() / (hi - lo) as f32;
+        (4.0 * avg).max(0.005)
     }
 }
 
@@ -289,6 +352,38 @@ mod tests {
             })
             .collect();
         assert_eq!(pick_band(&b, 10.0), Some((3000.0, 15000.0)));
+    }
+
+    #[test]
+    fn feet_inches_format() {
+        assert_eq!(feet_inches(1.0), "3' 3\"");
+        assert_eq!(feet_inches(0.3048), "1' 0\"");
+    }
+
+    #[test]
+    fn background_subtraction_isolates_new_echo() {
+        let fs = 48_000;
+        let tpl = chirp(fs, 0.01, 2000.0, 16000.0);
+        let make = |extra: Option<f32>| {
+            let mut rec = vec![0.0f32; 20_000];
+            let mut add = |at: usize, a: f32| {
+                for (i, &v) in tpl.iter().enumerate() {
+                    rec[at + i] += a * v;
+                }
+            };
+            add(1000, 1.0);
+            add(1000 + m_to_samples(0.8, fs), 0.3); // desk
+            add(1000 + m_to_samples(2.4, fs), 0.2); // wall
+            if let Some(d) = extra {
+                add(1000 + m_to_samples(d, fs), 0.1); // hand
+            }
+            aligned_average(&[matched_envelope(&rec, &tpl)], fs)
+        };
+        let bg = Background::capture(&[make(None), make(None)]);
+        let diff = bg.subtract(&make(Some(1.5)));
+        let echoes = find_echoes(&diff, 0.3, 4.0, 0.03);
+        assert_eq!(echoes.len(), 1, "{echoes:?}");
+        assert!((echoes[0].dist_m - 1.5).abs() < 0.03);
     }
 
     #[test]

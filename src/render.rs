@@ -1,6 +1,6 @@
 //! Output: range-profile bar chart, terminal blueprint, and SVG blueprint export.
 
-use crate::dsp::{Echo, RangeProfile};
+use crate::dsp::{feet_inches, fmt_len, Echo, RangeProfile};
 use crate::map::{Cell, Coverage, Grid, ScanMap};
 use std::fmt::Write as _;
 
@@ -27,7 +27,9 @@ pub fn file_stamp(ts: u64) -> String {
 
 // ------------------------------------------------------------------ ping bars
 
-pub fn bars(rp: &RangeProfile, echoes: &[Echo], max_range: f32, bin: f32, blank: f32, header: &str) -> String {
+/// `floor` keeps the scale honest: bars are drawn relative to max(strongest, floor),
+/// so pure noise doesn't get stretched to full width.
+pub fn bars(rp: &RangeProfile, echoes: &[Echo], max_range: f32, bin: f32, blank: f32, floor: f32, header: &str) -> String {
     let nb = (max_range / bin).ceil() as usize;
     let mut vals = vec![0.0f32; nb];
     for (i, &v) in rp.env.iter().enumerate() {
@@ -40,7 +42,7 @@ pub fn bars(rp: &RangeProfile, echoes: &[Echo], max_range: f32, bin: f32, blank:
             vals[b] = vals[b].max(v);
         }
     }
-    let top = vals.iter().cloned().fold(0.0, f32::max).max(1e-12);
+    let top = vals.iter().cloned().fold(0.0, f32::max).max(floor).max(1e-12);
     let width = 50.0;
     let mut s = String::new();
     let _ = writeln!(s, "{header}\n");
@@ -49,7 +51,8 @@ pub fn bars(rp: &RangeProfile, echoes: &[Echo], max_range: f32, bin: f32, blank:
         let hit = echoes.iter().any(|e| e.dist_m >= lo && e.dist_m < lo + bin);
         let _ = writeln!(
             s,
-            "{lo:5.2} m |{}{}",
+            "{lo:5.2} m {:>7} |{}{}",
+            feet_inches(lo),
             "█".repeat((v / top * width) as usize),
             if hit { "  ◀" } else { "" }
         );
@@ -61,7 +64,7 @@ pub fn bars(rp: &RangeProfile, echoes: &[Echo], max_range: f32, bin: f32, blank:
         let list: Vec<String> = echoes
             .iter()
             .take(5)
-            .map(|e| format!("{:.2} m ({:.0} dB)", e.dist_m, e.db()))
+            .map(|e| format!("{} {:.0} dB", fmt_len(e.dist_m), e.db()))
             .collect();
         let _ = writeln!(s, "Echoes (nearest first): {}", list.join(", "));
     }
@@ -195,7 +198,7 @@ pub fn terminal(map: &ScanMap, g: &Grid, cov: &Coverage, color: bool, cols: usiz
     // Scale bar: 1 m.
     let chars_per_m = (2.0 / block_m).round() as usize;
     if chars_per_m >= 3 {
-        let _ = writeln!(out, "\n ├{}┤ 1 m", "─".repeat(chars_per_m - 2));
+        let _ = writeln!(out, "\n ├{}┤ 1 m (3' 3\")", "─".repeat(chars_per_m - 2));
     }
     let legend = if color {
         "\x1b[38;2;255;255;255m██\x1b[0m wall (measured)   \x1b[38;2;130;190;245m▓▓\x1b[0m wall (assumed)   \x1b[38;2;95;150;205m·\x1b[0m open (measured)   \x1b[38;2;35;75;120m░░\x1b[0m unscanned   \x1b[1;38;2;255;214;102m◉\x1b[0m scan spot"
@@ -205,9 +208,11 @@ pub fn terminal(map: &ScanMap, g: &Grid, cov: &Coverage, color: bool, cols: usiz
     let _ = writeln!(out, " {legend}");
     let _ = writeln!(
         out,
-        "\n Footprint ≈ {:.2} × {:.2} m   Coverage: measured {:.0}% · assumed {:.0}% · unscanned {:.0}%",
+        "\n Footprint ≈ {:.2} × {:.2} m ({} × {})   Coverage: measured {:.0}% · assumed {:.0}% · unscanned {:.0}%",
         cov.width_m(),
         cov.height_m(),
+        feet_inches(cov.width_m()),
+        feet_inches(cov.height_m()),
         cov.measured_pct,
         cov.assumed_pct,
         cov.unscanned_pct
@@ -291,11 +296,11 @@ pub fn svg(map: &ScanMap, g: &Grid, cov: &Coverage) -> String {
     let (bx, _) = to_px(bx1, by1);
     let (_, cy) = to_px(bx0, by0);
     let dim = "#cfe6ff";
-    let _ = writeln!(s, r#"<g stroke="{dim}" stroke-width="1" fill="{dim}" font-size="12"><line x1="{ax:.1}" y1="{:.1}" x2="{bx:.1}" y2="{:.1}"/><line x1="{ax:.1}" y1="{:.1}" x2="{ax:.1}" y2="{:.1}"/><line x1="{bx:.1}" y1="{:.1}" x2="{bx:.1}" y2="{:.1}"/><text x="{:.1}" y="{:.1}" text-anchor="middle" stroke="none">{:.2} m</text><line x1="{:.1}" y1="{ay:.1}" x2="{:.1}" y2="{cy:.1}"/><line x1="{:.1}" y1="{ay:.1}" x2="{:.1}" y2="{ay:.1}"/><line x1="{:.1}" y1="{cy:.1}" x2="{:.1}" y2="{cy:.1}"/><text x="{:.1}" y="{:.1}" text-anchor="middle" stroke="none" transform="rotate(-90 {:.1} {:.1})">{:.2} m</text></g>"#,
+    let _ = writeln!(s, r#"<g stroke="{dim}" stroke-width="1" fill="{dim}" font-size="12"><line x1="{ax:.1}" y1="{:.1}" x2="{bx:.1}" y2="{:.1}"/><line x1="{ax:.1}" y1="{:.1}" x2="{ax:.1}" y2="{:.1}"/><line x1="{bx:.1}" y1="{:.1}" x2="{bx:.1}" y2="{:.1}"/><text x="{:.1}" y="{:.1}" text-anchor="middle" stroke="none">{}</text><line x1="{:.1}" y1="{ay:.1}" x2="{:.1}" y2="{cy:.1}"/><line x1="{:.1}" y1="{ay:.1}" x2="{:.1}" y2="{ay:.1}"/><line x1="{:.1}" y1="{cy:.1}" x2="{:.1}" y2="{cy:.1}"/><text x="{:.1}" y="{:.1}" text-anchor="middle" stroke="none" transform="rotate(-90 {:.1} {:.1})">{}</text></g>"#,
         ay - 24.0, ay - 24.0, ay - 30.0, ay - 18.0, ay - 30.0, ay - 18.0,
-        (ax + bx) / 2.0, ay - 30.0, cov.width_m(),
+        (ax + bx) / 2.0, ay - 30.0, xml_escape(&fmt_len(cov.width_m())),
         ax - 24.0, ax - 24.0, ax - 30.0, ax - 18.0, ax - 30.0, ax - 18.0,
-        ax - 30.0, (ay + cy) / 2.0, ax - 30.0, (ay + cy) / 2.0, cov.height_m());
+        ax - 30.0, (ay + cy) / 2.0, ax - 30.0, (ay + cy) / 2.0, xml_escape(&fmt_len(cov.height_m())));
 
     // Title block.
     let tb_w = 340.0f32.min(w - 20.0);

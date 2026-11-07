@@ -22,6 +22,8 @@ pub struct Profile {
     /// Matched-filter envelope level of room noise (absolute). 0 = unknown.
     pub noise_env: f32,
     pub direct_snr_db: f32,
+    #[serde(default)]
+    pub noise_rms: f32,
     pub latency_jitter_ms: f32,
     /// (band start Hz, SNR dB) for each 1 kHz band probed.
     pub band_snr: Vec<(f32, f32)>,
@@ -41,6 +43,7 @@ impl Profile {
             blank_m: 0.3,
             noise_env: 0.0,
             direct_snr_db: 0.0,
+            noise_rms: 0.0,
             latency_jitter_ms: 0.0,
             band_snr: Vec::new(),
             created_unix: 0,
@@ -148,6 +151,7 @@ pub fn run(sonar: &mut dyn Sonar) -> Result<Profile> {
     let noise = sonar.record(1.0)?;
     let noise_rms = (noise.iter().map(|x| x * x).sum::<f32>() / noise.len() as f32).sqrt();
     println!("      noise RMS {:.5}", noise_rms);
+    p.noise_rms = noise_rms;
 
     // 2. Frequency response probe: wide chirp, compare to noise per 1 kHz band
     println!("[2/4] Probing speaker/mic frequency response…");
@@ -206,10 +210,12 @@ pub fn run(sonar: &mut dyn Sonar) -> Result<Profile> {
         .map(|_| sonar.playrec(&tpl, listen, p.volume).map(|r| matched_envelope(&r, &tpl)))
         .collect();
     let rp = dsp::aligned_average(&envs?, fs);
-    let w = m_to_samples(0.05, fs).max(1);
-    let lim = rp.direct_peak * 0.05;
+    // Ring-down ends where the direct blast first decays below -20 dB. Echoes from
+    // the desk or monitor after that point are real reflections, not ringing, so
+    // they must not push the blanking distance out.
+    let lim = rp.direct_peak * 0.1;
     let mut k = 1;
-    while k + w < rp.env.len() && rp.env[k..k + w].iter().cloned().fold(0.0, f32::max) >= lim {
+    while k < rp.env.len() && rp.env[k] >= lim {
         k += 1;
     }
     p.blank_m = (samples_to_m(k, fs) + 0.05).clamp(0.12, 1.2);
@@ -218,10 +224,32 @@ pub fn run(sonar: &mut dyn Sonar) -> Result<Profile> {
     let sd = (idx.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / idx.len() as f32).sqrt();
     p.latency_jitter_ms = sd / fs as f32 * 1000.0;
     println!(
-        "      blanking distance {:.2} m · latency jitter {:.2} ms (cancelled by direct-path alignment)",
-        p.blank_m, p.latency_jitter_ms
+        "      blanking distance {} · latency jitter {:.2} ms (cancelled by direct-path alignment)",
+        dsp::fmt_len(p.blank_m),
+        p.latency_jitter_ms
     );
 
     p.created_unix = now();
     Ok(p)
+}
+
+/// Problems that make a profile useless; empty = good to save.
+pub fn problems(p: &Profile) -> Vec<String> {
+    let mut v = Vec::new();
+    if p.noise_rms < 1e-5 {
+        v.push(format!(
+            "the microphone is digitally silent (noise RMS {:.6}). It's probably not a real mic: \
+             on Linux check `pactl get-default-source` isn't a *.monitor or iec958 (S/PDIF) input, \
+             and that the mic isn't muted",
+            p.noise_rms
+        ));
+    }
+    if p.direct_snr_db < 20.0 {
+        v.push(format!(
+            "the mic barely hears the speaker ({:.0} dB SNR, need 20+). Put the mic right next to the \
+             speaker, raise the mic level, and turn off noise suppression / echo cancellation",
+            p.direct_snr_db
+        ));
+    }
+    v
 }

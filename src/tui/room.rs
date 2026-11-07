@@ -26,25 +26,64 @@ fn arrow(deg: f32) -> char {
     ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'][((deg.rem_euclid(360.0) + 22.5) / 45.0) as usize % 8]
 }
 
-/// Draw the room to scale: optional heat image, nodes, and a target marker.
+/// Draw the room to scale like an architect's plan: wall dimensions on the
+/// walls, optional heat image, devices, guide lines for the selected device,
+/// and a target marker.
 fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, mark: Option<(f32, f32)>, sel: Option<usize>, title: String) {
-    let aw = area.width.saturating_sub(2).max(4) as f32;
-    let ah = area.height.saturating_sub(2).max(2) as f32;
+    const LEFT: u16 = 11; // room for the depth dimension down the left wall
+    const TOP: u16 = 1; // room for the width dimension along the top wall
+    let aw = area.width.saturating_sub(2 + LEFT).max(4) as f32;
+    let ah = area.height.saturating_sub(2 + TOP).max(2) as f32;
     // One text row = s metres; one column = s/2 metres (terminal cells are ~2:1).
     let s = (l.width_m / (aw / 2.0)).max(l.depth_m / ah);
     let cols = ((l.width_m / s) * 2.0).round().max(2.0) as usize;
     let rows = (l.depth_m / s).round().max(1.0) as usize;
+    let used_w = cols as u16 + 2 + LEFT;
+    let used_h = rows as u16 + 2 + TOP;
+    let ox = area.x + area.width.saturating_sub(used_w) / 2;
+    let oy = area.y + area.height.saturating_sub(used_h) / 2;
     let rect = Rect {
-        x: area.x + (area.width.saturating_sub(cols as u16 + 2)) / 2,
-        y: area.y + (area.height.saturating_sub(rows as u16 + 2)) / 2,
-        width: (cols as u16 + 2).min(area.width),
-        height: (rows as u16 + 2).min(area.height),
+        x: ox + LEFT,
+        y: oy + TOP,
+        width: (cols as u16 + 2).min(area.width.saturating_sub(LEFT)),
+        height: (rows as u16 + 2).min(area.height.saturating_sub(TOP)),
     };
     let to_cell = |x: f32, y: f32| -> (usize, usize) {
         let c = ((x / s) * 2.0).floor().clamp(0.0, cols as f32 - 1.0) as usize;
         let r = ((l.depth_m - y) / s).floor().clamp(0.0, rows as f32 - 1.0) as usize;
         (r, c)
     };
+
+    // Width dimension along the top wall: ├──── 11' 6" · 3.50 m ────┤
+    let wtxt = format!(" {} · {:.2} m ", feet_inches(l.width_m), l.width_m);
+    let inner_w = cols.saturating_sub(2);
+    let dash = inner_w.saturating_sub(wtxt.chars().count());
+    let wline = format!("├{}{}{}┤", "─".repeat(dash / 2), wtxt, "─".repeat(dash - dash / 2));
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(wline, Style::new().fg(LINE)))),
+        Rect { x: rect.x + 1, y: oy, width: cols as u16, height: 1 },
+    );
+    // Depth dimension down the left wall.
+    let dtxt = [feet_inches(l.depth_m), format!("{:.2} m", l.depth_m)];
+    let mid = rows / 2;
+    let dlines: Vec<Line> = (0..rows)
+        .map(|r| {
+            let t = if r == 0 {
+                "┬".to_string()
+            } else if r + 1 == rows {
+                "┴".to_string()
+            } else if r == mid.saturating_sub(1) {
+                dtxt[0].clone()
+            } else if r == mid {
+                dtxt[1].clone()
+            } else {
+                "│".to_string()
+            };
+            Line::from(Span::styled(t, Style::new().fg(LINE))).alignment(Alignment::Center)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(dlines), Rect { x: ox, y: rect.y + 1, width: LEFT - 1, height: rows as u16 });
+
     let top = img.map(|i| i.max()).unwrap_or(0.0).max(1e-9);
     let mut grid: Vec<Vec<(String, Style)>> = (0..rows)
         .map(|r| {
@@ -63,6 +102,17 @@ fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, m
                 .collect()
         })
         .collect();
+    // Guide lines from the selected device to the left wall and the top wall.
+    if let Some(n) = sel.and_then(|k| l.nodes.get(k)) {
+        let (r, c) = to_cell(n.x, n.y);
+        let g = Style::new().fg(ACCENT).bg(NAVY);
+        for cc in 0..c {
+            grid[r][cc] = ("┄".into(), g);
+        }
+        for rr in 0..r {
+            grid[rr][c] = ("┆".into(), g);
+        }
+    }
     for (k, n) in l.nodes.iter().enumerate() {
         let (r, c) = to_cell(n.x, n.y);
         let mut st = match n.kind {
@@ -91,19 +141,14 @@ fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, m
     let block = Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(Style::new().fg(Color::White))
-        .title(Span::styled(title, Style::new().fg(LINE)));
+        .title(Span::styled(title, Style::new().fg(LINE)))
+        .title(Line::from(Span::styled(" TOP WALL ", Style::new().fg(DIM))).alignment(Alignment::Right))
+        .title_bottom(Line::from(Span::styled(" BOTTOM WALL ", Style::new().fg(DIM))).alignment(Alignment::Right));
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 fn room_title(l: &plan::Layout) -> String {
-    format!(
-        " {} · {:.2} × {:.2} m ({} × {}) ",
-        l.name,
-        l.width_m,
-        l.depth_m,
-        feet_inches(l.width_m),
-        feet_inches(l.depth_m)
-    )
+    format!(" {} ", l.name)
 }
 
 // ------------------------------------------------------------------ room designer
@@ -218,14 +263,32 @@ pub(super) fn draw_designer(f: &mut Frame, left: Rect, right: Rect, d: &Designer
         Line::raw(""),
         Line::from(Span::styled(" DEVICES", Style::new().fg(DIM))),
     ];
+    lines.insert(3, Line::from(Span::styled(" Positions are measured from the", Style::new().fg(DIM))));
+    lines.insert(4, Line::from(Span::styled(" LEFT wall and the TOP wall of the plan.", Style::new().fg(DIM))));
+    lines.insert(5, Line::raw(""));
+    let speakers: Vec<&Node> = d.l.speakers();
     for (k, n) in d.l.nodes.iter().enumerate() {
-        let st = if k == d.sel { Style::new().fg(NAVY).bg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::new() };
-        let kind = if n.kind == Kind::Speaker { "speaker" } else { "mic    " };
-        lines.push(Line::from(Span::styled(
-            format!(" {:<3}{} {} {:>7} → {:>7} ↑ {}", n.label, arrow(n.facing_deg), kind, feet_inches(n.x), feet_inches(n.y), ""),
-            st,
-        )));
-        lines.push(Line::from(Span::styled(format!("      {}", n.device), Style::new().fg(DIM))));
+        let head = if k == d.sel { Style::new().fg(NAVY).bg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::new().add_modifier(Modifier::BOLD) };
+        let kind = if n.kind == Kind::Speaker { "speaker" } else { "mic" };
+        lines.push(Line::from(Span::styled(format!(" {} {} {:<29}", n.label, arrow(n.facing_deg), kind), head)));
+        lines.push(Line::from(vec![
+            Span::styled("    ← ", Style::new().fg(ACCENT)),
+            Span::raw(feet_inches(n.x)),
+            Span::styled(" from left · ", Style::new().fg(DIM)),
+            Span::styled("↑ ", Style::new().fg(ACCENT)),
+            Span::raw(feet_inches(d.l.depth_m - n.y)),
+            Span::styled(" from top", Style::new().fg(DIM)),
+        ]));
+        if n.kind == Kind::Mic {
+            for sp in &speakers {
+                lines.push(Line::from(vec![
+                    Span::styled("    ↔ ", Style::new().fg(ACCENT)),
+                    Span::raw(format!("{:<7}", feet_inches(plan::dist(n.pos(), sp.pos())))),
+                    Span::styled(format!(" from {}", sp.label), Style::new().fg(DIM)),
+                ]));
+            }
+        }
+        lines.push(Line::from(Span::styled(format!("    device: {}", n.device), Style::new().fg(DIM))));
     }
     lines.push(Line::raw(""));
     let sp = d.l.speakers().len();

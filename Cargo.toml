@@ -1,6 +1,6 @@
 [package]
 name = "chirpmap"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 description = "Terminal-native acoustic echolocation that maps rooms like an architect's blueprint, using any speaker and mic. Fully offline."
 repository = "https://github.com/FletchEm31/ChripMap"

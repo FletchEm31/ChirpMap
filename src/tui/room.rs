@@ -156,8 +156,8 @@ fn room_title(l: &plan::Layout) -> String {
 pub(super) struct Designer {
     pub l: plan::Layout,
     pub sel: usize,
-    outs: Vec<String>,
-    ins: Vec<String>,
+    outs: Vec<Choice>,
+    ins: Vec<Choice>,
 }
 
 pub(super) enum Outcome {
@@ -167,14 +167,34 @@ pub(super) enum Outcome {
 
 /// "default" plus one entry per sound card (the sysdefault:CARD=… names), so
 /// cycling devices is a handful of presses, not fifty ALSA aliases.
-fn device_choices() -> (Vec<String>, Vec<String>) {
+/// What `n` cycles through: "default", then every PipeWire speaker/mic by its
+/// real name (routed through PipeWire, so nothing is "busy"); plain ALSA
+/// cards only when PipeWire isn't available.
+type Choice = (String, String); // (stored device string, label shown)
+
+fn device_choices() -> (Vec<Choice>, Vec<Choice>) {
+    let def = || vec![("default".to_string(), "system default".to_string())];
+    let sinks = audio::pw_endpoints("sinks");
+    let sources = audio::pw_endpoints("sources");
+    if !sinks.is_empty() || !sources.is_empty() {
+        let wrap = |v: Vec<(String, String)>| {
+            let mut out = def();
+            out.extend(v.into_iter().map(|(n, d)| (format!("pw:{n}"), d)));
+            out
+        };
+        return (wrap(sinks), wrap(sources));
+    }
     audio::quiet(|| {
         let host = cpal::default_host();
         use cpal::traits::{DeviceTrait, HostTrait};
         let pick = |names: Vec<String>| {
-            let mut v = vec!["default".to_string()];
-            // One entry per card (+ HDMI outputs, where AV receivers usually live).
-            v.extend(names.into_iter().filter(|n| n.starts_with("sysdefault:CARD=") || n.starts_with("hdmi:CARD=")));
+            let mut v = def();
+            v.extend(
+                names
+                    .into_iter()
+                    .filter(|n| n.starts_with("sysdefault:CARD=") || n.starts_with("hdmi:CARD="))
+                    .map(|n| (n.clone(), n)),
+            );
             v
         };
         let outs = host.output_devices().map(|d| d.filter_map(|x| x.name().ok()).collect()).unwrap_or_default();
@@ -183,9 +203,34 @@ fn device_choices() -> (Vec<String>, Vec<String>) {
     })
 }
 
+/// "Starship/Matisse HD Audio Controller Digital Stereo (IEC958)" → "Starship/Matisse (optical)".
+fn short(desc: &str) -> String {
+    let mut d = desc.to_string();
+    for junk in [" HD Audio Controller", " Audio Controller", " Digital Stereo", " Analog Stereo", " Analog Mono"] {
+        d = d.replace(junk, "");
+    }
+    d = d.replace("(IEC958)", "(optical)");
+    if d.chars().count() > 30 {
+        d = d.chars().take(29).collect::<String>() + "…";
+    }
+    d
+}
+
+fn label_for(choices: &[Choice], device: &str) -> String {
+    choices
+        .iter()
+        .find(|(id, _)| id == device)
+        .map(|(_, l)| short(l))
+        .unwrap_or_else(|| short(device.trim_start_matches("pw:")))
+}
+
 impl Designer {
     pub fn new() -> Self {
-        let (outs, ins) = if sim_mode() { (vec!["default".into()], vec!["default".into()]) } else { device_choices() };
+        let (outs, ins) = if sim_mode() {
+            (vec![("default".into(), "simulated".into())], vec![("default".into(), "simulated".into())])
+        } else {
+            device_choices()
+        };
         Designer { l: plan::load_active().unwrap_or_else(plan::Layout::starter), sel: 0, outs, ins }
     }
 
@@ -254,8 +299,8 @@ impl Designer {
                     KeyCode::Char(']') => node.facing_deg += 45.0,
                     _ => {
                         let list = if node.kind == Kind::Speaker { &outs } else { &ins };
-                        let i = list.iter().position(|d| *d == node.device).map_or(0, |i| (i + 1) % list.len());
-                        node.device = list[i].clone();
+                        let i = list.iter().position(|(id, _)| *id == node.device).map_or(0, |i| (i + 1) % list.len());
+                        node.device = list[i].0.clone();
                     }
                 }
             }
@@ -298,7 +343,8 @@ pub(super) fn draw_designer(f: &mut Frame, left: Rect, right: Rect, d: &Designer
                 ]));
             }
         }
-        lines.push(Line::from(Span::styled(format!("    device: {}", n.device), Style::new().fg(DIM))));
+        let choices = if n.kind == Kind::Speaker { &d.outs } else { &d.ins };
+        lines.push(Line::from(Span::styled(format!("    device: {}", label_for(choices, &n.device)), Style::new().fg(DIM))));
         if n.kind == Kind::Speaker {
             lines.push(Line::from(Span::styled(format!("    plays on: {}", plan::channel_name(n.channel)), Style::new().fg(DIM))));
         }

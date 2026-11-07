@@ -121,6 +121,48 @@ fn describe_endpoint(kind: &str, id: &str) -> Endpoint {
     Endpoint { id: id.to_string(), description: id.to_string() }
 }
 
+/// Every PipeWire/PulseAudio sink or source as (node name, human description),
+/// skipping speaker monitors (loopbacks, not microphones).
+pub fn pw_endpoints(kind: &str) -> Vec<(String, String)> {
+    let listing = pactl(&["list", kind]).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    for line in listing.lines() {
+        let l = line.trim();
+        if let Some(n) = l.strip_prefix("Name: ") {
+            name = Some(n.to_string());
+        } else if let Some(d) = l.strip_prefix("Description: ") {
+            if let Some(n) = name.take() {
+                if !n.ends_with(".monitor") {
+                    out.push((n, d.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Layout device strings: "default", "pw:<PipeWire node name>", or an ALSA name.
+/// Returns (ALSA device to open, PipeWire target to route it to).
+pub fn resolve_device(device: &str) -> (Option<&str>, Option<&str>) {
+    if let Some(node) = device.strip_prefix("pw:") {
+        (Some("pipewire"), Some(node))
+    } else if device == "default" || device.is_empty() {
+        (None, None)
+    } else {
+        (Some(device), None)
+    }
+}
+
+/// Point the next ALSA "pipewire" stream at a specific node (or the default).
+/// pipewire-alsa reads PIPEWIRE_NODE when a stream is opened.
+pub fn route_next_stream(target: Option<&str>) {
+    match target {
+        Some(t) => std::env::set_var("PIPEWIRE_NODE", t),
+        None => std::env::remove_var("PIPEWIRE_NODE"),
+    }
+}
+
 /// The speaker and mic the system "default" device actually routes to (Linux, via pactl).
 pub fn system_defaults() -> Option<(Endpoint, Endpoint)> {
     let sink = pactl(&["get-default-sink"])?;
@@ -201,6 +243,30 @@ pub struct CpalSonar {
     in_fmt: SampleFormat,
     fs: u32,
     in_rate: u32,
+    /// PipeWire targets when devices were picked by real name ("pw:…").
+    out_pw: Option<String>,
+    in_pw: Option<String>,
+    /// Human names of the real devices (used for display and calibration profiles).
+    out_label: String,
+    in_label: String,
+}
+
+/// The real device behind a choice: its PipeWire description when routed via
+/// PipeWire or the system default, else the ALSA name.
+fn real_label(dev: &Device, pw: Option<&str>, kind: &str) -> String {
+    if let Some(node) = pw {
+        if let Some((_, d)) = pw_endpoints(kind).into_iter().find(|(n, _)| n == node) {
+            return d;
+        }
+        return node.to_string();
+    }
+    let n = dev_name(dev);
+    if n == "default" || n == "pipewire" || n == "pulse" {
+        if let Some((sink, source)) = system_defaults() {
+            return if kind == "sinks" { sink.description } else { source.description };
+        }
+    }
+    n
 }
 
 impl CpalSonar {
@@ -210,18 +276,23 @@ impl CpalSonar {
 
     fn open_inner(output: Option<&str>, input: Option<&str>) -> Result<Self> {
         let host = cpal::default_host();
+        let (o_sel, o_pw) = resolve_device(output.unwrap_or("default"));
+        let (i_sel, i_pw) = resolve_device(input.unwrap_or("default"));
+        let (out_pw, in_pw) = (o_pw.map(str::to_string), i_pw.map(str::to_string));
         let out = select(
             host.output_devices()?.collect(),
             host.default_output_device(),
-            output,
+            o_sel,
             "output",
         )?;
         let inp = select(
             host.input_devices()?.collect(),
             host.default_input_device(),
-            input,
+            i_sel,
             "input",
         )?;
+        let out_label = real_label(&out, out_pw.as_deref(), "sinks");
+        let in_label = real_label(&inp, in_pw.as_deref(), "sources");
 
         let oc = out
             .default_output_config()
@@ -248,7 +319,7 @@ impl CpalSonar {
             }
         }
         let in_rate = in_cfg.sample_rate.0;
-        Ok(Self { out, inp, out_cfg, out_fmt, in_cfg, in_fmt, fs, in_rate })
+        Ok(Self { out, inp, out_cfg, out_fmt, in_cfg, in_fmt, fs, in_rate, out_pw, in_pw, out_label, in_label })
     }
 }
 
@@ -345,7 +416,7 @@ impl Sonar for CpalSonar {
     }
 
     fn name(&self) -> String {
-        format!("{} → {}", dev_name(&self.out), dev_name(&self.inp))
+        format!("{} → {}", self.out_label, self.in_label)
     }
 
     fn playrec(&mut self, sig: &[f32], listen_s: f32, volume: f32) -> Result<Vec<f32>> {
@@ -359,12 +430,14 @@ impl Sonar for CpalSonar {
             (dur * self.in_rate as f32) as usize + 4096,
         )));
         let ins = quiet(|| -> Result<Stream> {
+            route_next_stream(self.in_pw.as_deref());
             let s = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
             s.play()?;
             Ok(s)
         })?;
         std::thread::sleep(Duration::from_millis(40));
         let outs = quiet(|| -> Result<Stream> {
+            route_next_stream(self.out_pw.as_deref());
             let s = build_output(
                 &self.out,
                 &self.out_cfg,
@@ -394,6 +467,7 @@ impl Sonar for CpalSonar {
     fn record(&mut self, secs: f32) -> Result<Vec<f32>> {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let ins = quiet(|| -> Result<Stream> {
+            route_next_stream(self.in_pw.as_deref());
             let s = build_input(&self.inp, &self.in_cfg, self.in_fmt, buf.clone())?;
             s.play()?;
             Ok(s)
@@ -610,6 +684,16 @@ fn hardware_panel_inner() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_strings_resolve() {
+        assert_eq!(resolve_device("default"), (None, None));
+        assert_eq!(
+            resolve_device("pw:alsa_output.pci-0000_0d_00.4.iec958-stereo"),
+            (Some("pipewire"), Some("alsa_output.pci-0000_0d_00.4.iec958-stereo"))
+        );
+        assert_eq!(resolve_device("sysdefault:CARD=C920"), (Some("sysdefault:CARD=C920"), None));
+    }
 
     #[test]
     fn single_channel_output_keeps_other_channels_silent() {

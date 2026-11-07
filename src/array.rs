@@ -42,6 +42,8 @@ struct Port {
     rate: u32,
     /// Speakers: play on just this channel (None = all).
     only: Option<usize>,
+    /// PipeWire node this stream must be routed to (devices picked by real name).
+    pw: Option<String>,
 }
 
 pub struct CpalArray {
@@ -51,7 +53,11 @@ pub struct CpalArray {
 }
 
 fn sel(device: &str) -> Option<&str> {
-    (device != "default" && !device.is_empty()).then_some(device)
+    crate::audio::resolve_device(device).0
+}
+
+fn pw_of(device: &str) -> Option<String> {
+    crate::audio::resolve_device(device).1.map(str::to_string)
 }
 
 impl CpalArray {
@@ -75,7 +81,7 @@ impl CpalArray {
                     bail!("{}: '{}' has {} channel(s), no channel {}", n.label, n.device, c.channels(), ch + 1);
                 }
             }
-            outs.push(Port { rate: c.sample_rate().0, fmt: c.sample_format(), cfg: c.into(), dev, only });
+            outs.push(Port { rate: c.sample_rate().0, fmt: c.sample_format(), cfg: c.into(), dev, only, pw: pw_of(&n.device) });
         }
         let fs = outs[0].rate;
         let mut ins = Vec::new();
@@ -83,7 +89,7 @@ impl CpalArray {
             let dev = select(host.input_devices()?.collect(), host.default_input_device(), sel(&n.device), "input")
                 .with_context(|| format!("{}: mic '{}'", n.label, n.device))?;
             let c = dev.default_input_config()?;
-            let mut p = Port { rate: c.sample_rate().0, fmt: c.sample_format(), cfg: c.into(), dev, only: None };
+            let mut p = Port { rate: c.sample_rate().0, fmt: c.sample_format(), cfg: c.into(), dev, only: None, pw: pw_of(&n.device) };
             if p.rate != fs {
                 if let Ok(ranges) = p.dev.supported_input_configs() {
                     if let Some(r) = ranges
@@ -119,6 +125,7 @@ impl ArrayIo for CpalArray {
         let ins: Vec<Stream> = quiet(|| -> Result<Vec<Stream>> {
             let mut v = Vec::new();
             for (p, b) in self.ins.iter().zip(&bufs) {
+                crate::audio::route_next_stream(p.pw.as_deref());
                 let s = build_input(&p.dev, &p.cfg, p.fmt, b.clone())?;
                 s.play()?;
                 v.push(s);
@@ -134,6 +141,7 @@ impl ArrayIo for CpalArray {
         play.extend(std::iter::repeat(0.0).take((listen_s * r) as usize));
         let dur = play.len() as f32 / r + 0.3;
         let outs = quiet(|| -> Result<Stream> {
+            crate::audio::route_next_stream(out.pw.as_deref());
             let s = build_output(&out.dev, &out.cfg, out.fmt, Arc::new(play), Arc::new(AtomicUsize::new(0)), out.only)?;
             s.play()?;
             Ok(s)

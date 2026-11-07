@@ -136,3 +136,13 @@ Grew out of `echo.py`, a Python proof of concept (chirp, matched filter, termina
 - Each mic can be a different USB device with its own clock. ChirpMap anchors each pair using the direct speaker→mic sound and the distance from your layout, so the devices don't need to be synchronised.
 
 Keys: `r` re-captures the empty room, `t` switches between "what moves" and "every reflector".
+
+### Picking devices by name (v0.7.4)
+
+In the Room designer, `n` cycles through every speaker and mic by its real name, as PipeWire reports it (e.g. *AC511 Sound Bar*, *Starship/Matisse (optical)* for an AV receiver on optical, *Navi 21/23 HDMI/DP* for a monitor). Each one is opened through PipeWire, so nothing is "busy" and other apps keep playing. `c` picks the channel, so a receiver's left and right towers can be two separate speakers.
+
+Calibration profiles are saved per real device pair, so each speaker keeps its own calibration. To calibrate a speaker that isn't the system default:
+
+```bash
+chirpmap calibrate --output "pw:<sink name from: pactl list short sinks>"
+```

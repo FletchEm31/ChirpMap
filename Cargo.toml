@@ -3,8 +3,11 @@ name = "chirpmap"
 version = "0.8.0"
 edition = "2021"
 description = "Terminal-native acoustic echolocation that maps rooms like an architect's blueprint, using any speaker and mic. Fully offline."
-repository = "https://github.com/FletchEm31/ChripMap"
+repository = "https://github.com/FletchEm31/ChirpMap"
 readme = "README.md"
+homepage = "https://github.com/FletchEm31/ChirpMap"
+keywords = ["echolocation", "sonar", "acoustics", "indoor-positioning", "tui"]
+categories = ["command-line-utilities", "multimedia::audio", "science"]
 
 [dependencies]
 anyhow = "1.0.86"

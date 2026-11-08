@@ -60,6 +60,10 @@ const ITEMS: &[Item] = &[
         help: "Draw your room to scale and place every speaker and microphone: where it sits, which way it faces, and which physical device it is. ChirpMap uses this geometry to turn echoes into positions." },
     Item { key: '8', name: "Array tracker", blurb: "2D, all pairs",
         help: "Uses every speaker → mic pair in your room layout at once and shows where things are ON THE FLOOR PLAN as a heat map. More speakers and mics = more pairs = a sharper fix." },
+    Item { key: '9', name: "Replay", blurb: "recorded sessions",
+        help: "Play back a session you recorded in the Array tracker (press v there to record). Space play/pause, ← → step a frame, PgUp/PgDn jump, + − speed, [ ] older/newer session." },
+    Item { key: 's', name: "Silent mode", blurb: "",
+        help: "Moves the chirp up to 18–21 kHz, above most adults' hearing, so the tracker can run all day without the ticking. Needs a speaker and mic that reach that high (calibration reports it) and a 44.1 kHz+ sample rate. Kids and pets may still hear it. Turn it off here." },
     Item { key: 'u', name: "Update", blurb: "git pull + reinstall",
         help: "Pulls the latest ChirpMap from GitHub into the folder it was built from and reinstalls it. Restart chirpmap afterwards." },
     Item { key: 'q', name: "Quit", blurb: "", help: "Leave ChirpMap. Any audio levels it changed are already put back." },
@@ -99,6 +103,7 @@ enum Mode {
     Live(Live),
     Designer(room::Designer),
     Array(room::ArrayView),
+    Replay(room::Replay),
 }
 
 struct App {
@@ -292,6 +297,17 @@ fn activate(app: &mut App, terminal: &mut DefaultTerminal, key: char) {
             Ok(v) => app.mode = Mode::Array(v),
             Err(e) => app.note = Some(e),
         },
+        '9' => app.mode = Mode::Replay(room::Replay::new()),
+        's' => {
+            let mut s = crate::settings::load();
+            s.silent = !s.silent;
+            crate::settings::save(&s);
+            app.note = Some(if s.silent {
+                "Silent mode ON — chirps at 18–21 kHz (array speakers take turns; the band is too narrow to split).".into()
+            } else {
+                "Silent mode OFF — back to the calibrated band.".into()
+            });
+        }
         'q' => app.quit = true,
         _ => {}
     }
@@ -323,6 +339,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if let Mode::Array(a) = &mut app.mode {
             a.drain();
         }
+        if let Mode::Replay(r) = &mut app.mode {
+            r.tick();
+        }
         terminal.draw(|f| draw(f, app))?;
         if !event::poll(Duration::from_millis(60))? {
             continue;
@@ -344,9 +363,17 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             }
             continue;
         }
-        if let Mode::Array(a) = &app.mode {
+        if let Mode::Replay(r) = &mut app.mode {
+            if ctrl_c || r.key(k) {
+                app.mode = Mode::Menu;
+            }
+            continue;
+        }
+        if let Mode::Array(a) = &mut app.mode {
             if ctrl_c || matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') | KeyCode::Backspace) {
                 app.mode = Mode::Menu;
+            } else if k.code == KeyCode::Char('v') {
+                a.toggle_recording();
             } else if k.code == KeyCode::Char('r') || k.code == KeyCode::Char('t') {
                 // r: re-capture the empty room · t: toggle tracker / every reflector
                 let diff = if k.code == KeyCode::Char('t') { !a.diff } else { a.diff };
@@ -388,7 +415,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     _ => {}
                 }
             }
-            Mode::Designer(_) | Mode::Array(_) => {}
+            Mode::Designer(_) | Mode::Array(_) | Mode::Replay(_) => {}
             Mode::Menu => {
                 app.note = None;
                 if ctrl_c {
@@ -444,7 +471,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let body = Layout::horizontal([Constraint::Length(43), Constraint::Min(20)]).split(rows[1]);
     let view = match &app.mode {
         Mode::Designer(_) => 0,
-        Mode::Array(_) => 1,
+        Mode::Array(_) | Mode::Replay(_) => 1,
         Mode::Live(_) => 2,
         _ => 3,
     };
@@ -454,6 +481,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Designer(d) => room::draw_designer(f, body[0], body[1], d),
         Mode::Array(a) => room::draw_array(f, body[1], a),
+        Mode::Replay(r) => room::draw_replay(f, body[1], r),
         Mode::Live(live) => draw_live(f, body[1], live),
         _ => draw_info(f, body[1], app),
     }
@@ -465,8 +493,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         Mode::Live(_) => " Esc/q back to menu · r re-capture background · Ctrl+C back ",
         Mode::AskLevels { .. } => " y use levels · n keep yours · Esc cancel ",
         Mode::Designer(_) => " Tab device · arrows move · [ ] turn · n device · c channel · a/m add · x delete · Enter save · Esc cancel ",
-        Mode::Array(_) => " Esc/q back · r re-capture empty room · t tracker ⇄ every reflector ",
-        Mode::Menu => " ↑↓ select · Enter run · 1-8 jump · q quit ",
+        Mode::Array(_) => " Esc/q back · r re-capture empty room · t tracker ⇄ every reflector · v record ",
+        Mode::Replay(_) => " Space play/pause · ← → step · PgUp/PgDn jump · Home/End · + − speed · [ ] older/newer · Esc back ",
+        Mode::Menu => " ↑↓ select · Enter run · 1-9 jump · s silent mode · q quit ",
     };
     let footer = match &app.note {
         Some(n) => Line::from(Span::styled(format!(" {n}"), Style::new().fg(HIT).add_modifier(Modifier::BOLD))),
@@ -496,13 +525,19 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_menu(f: &mut Frame, area: Rect, app: &mut App) {
+    let silent = crate::settings::load().silent;
     let items: Vec<ListItem> = ITEMS
         .iter()
         .map(|it| {
+            let blurb = match it.key {
+                's' if silent => Span::styled("ON · 18–21 kHz", Style::new().fg(OK)),
+                's' => Span::styled("off · audible", Style::new().fg(DIM)),
+                _ => Span::styled(it.blurb, Style::new().fg(DIM)),
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{} ", it.key), Style::new().fg(DIM)),
                 Span::raw(format!("{:<15}", it.name)),
-                Span::styled(it.blurb, Style::new().fg(DIM)),
+                blurb,
             ]))
         })
         .collect();

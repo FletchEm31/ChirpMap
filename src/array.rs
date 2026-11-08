@@ -10,7 +10,7 @@
 //! geometry: the direct speaker→mic arrival is found in the recording, and the
 //! known speaker–mic distance from the room layout says when the chirp left.
 
-use crate::audio::{build_input, build_output, dev_name, quiet, select};
+use crate::audio::{build_input, dev_name, quiet, select};
 use crate::dsp::{self, argmax, matched_envelope, resample, Background, RangeProfile, SPEED_OF_SOUND};
 use crate::layout::{dist, Layout};
 use anyhow::{bail, Context, Result};
@@ -20,17 +20,15 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Seconds → samples for a full path length (not a round trip).
-fn path_samples(m: f32, fs: u32) -> f32 {
-    m / SPEED_OF_SOUND * fs as f32
-}
-
 pub trait ArrayIo {
     fn fs(&self) -> u32;
     fn describe(&self) -> String;
     /// Play `sig` on speaker `spk` (layout order) and return one recording per
     /// mic (layout order), all at `fs()`.
     fn ping(&mut self, spk: usize, sig: &[f32], listen_s: f32, volume: f32) -> Result<Vec<Vec<f32>>>;
+    /// Every speaker plays its own code (`sigs`, layout order) at the same
+    /// moment; one recording per mic.
+    fn ping_all(&mut self, sigs: &[Vec<f32>], listen_s: f32, volume: f32) -> Result<Vec<Vec<f32>>>;
 }
 
 // ------------------------------------------------------------------ real hardware
@@ -120,7 +118,34 @@ impl ArrayIo for CpalArray {
     }
 
     fn ping(&mut self, spk: usize, sig: &[f32], listen_s: f32, volume: f32) -> Result<Vec<Vec<f32>>> {
-        let out = self.outs.get(spk).context("no such speaker")?;
+        if spk >= self.outs.len() {
+            bail!("no such speaker");
+        }
+        self.play_and_record(&[(spk, sig)], listen_s, volume)
+    }
+
+    fn ping_all(&mut self, sigs: &[Vec<f32>], listen_s: f32, volume: f32) -> Result<Vec<Vec<f32>>> {
+        let parts: Vec<(usize, &[f32])> = sigs.iter().enumerate().take(self.outs.len()).map(|(k, s)| (k, s.as_slice())).collect();
+        self.play_and_record(&parts, listen_s, volume)
+    }
+}
+
+impl CpalArray {
+    /// Play each (speaker, signal) at the same moment and record every mic.
+    /// Speakers on the same device (e.g. receiver L and R) share one stream.
+    fn play_and_record(&mut self, parts: &[(usize, &[f32])], listen_s: f32, volume: f32) -> Result<Vec<Vec<f32>>> {
+        // Group speakers by device.
+        let mut groups: Vec<(usize, Vec<(Option<usize>, Vec<f32>)>)> = Vec::new();
+        for &(k, sig) in parts {
+            let out = &self.outs[k];
+            let scaled: Vec<f32> = sig.iter().map(|x| x * volume).collect();
+            let key = self.outs.iter().position(|o| o.pw == out.pw && dev_name(&o.dev) == dev_name(&out.dev)).unwrap_or(k);
+            match groups.iter_mut().find(|g| g.0 == key) {
+                Some(g) => g.1.push((out.only, scaled)),
+                None => groups.push((key, vec![(out.only, scaled)])),
+            }
+        }
+
         // Mics: devices picked by name record through pw-record; the default via cpal.
         let bufs: Vec<Arc<Mutex<Vec<f32>>>> = self.ins.iter().map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
         let mut pw_recs: Vec<Option<crate::pwio::Recording>> = Vec::new();
@@ -144,29 +169,48 @@ impl ArrayIo for CpalArray {
         let warm = if pw_recs.iter().any(Option::is_some) { crate::pwio::RECORD_WARMUP } else { Duration::from_millis(60) };
         std::thread::sleep(warm);
 
-        let scaled: Vec<f32> = sig.iter().map(|x| x * volume).collect();
-        match &out.pw {
-            Some(node) => {
-                // Speaker picked by name: pw-play targets it reliably.
-                let player = crate::pwio::play(node, self.fs, out.cfg.channels, out.only, &scaled)?;
-                crate::pwio::wait_player(player)?;
-                std::thread::sleep(Duration::from_secs_f32(listen_s + 0.3));
-            }
-            None => {
-                let r = out.rate as f32;
-                let mut play = vec![0.0f32; (0.05 * r) as usize];
-                play.extend(resample(&scaled, self.fs, out.rate));
-                play.extend(std::iter::repeat(0.0).take((listen_s * r) as usize));
-                let dur = play.len() as f32 / r + 0.3;
-                let outs = quiet(|| -> Result<Stream> {
-                    let s = build_output(&out.dev, &out.cfg, out.fmt, Arc::new(play), Arc::new(AtomicUsize::new(0)), out.only)?;
-                    s.play()?;
-                    Ok(s)
-                })?;
-                std::thread::sleep(Duration::from_secs_f32(dur));
-                drop(outs);
+        // Start every device, then wait for all of them.
+        let mut players = Vec::new();
+        let mut streams = Vec::new();
+        let mut longest = 0.0f32;
+        for (gi, (key, sigs)) in groups.iter().enumerate() {
+            let out = &self.outs[*key];
+            let ch = out.cfg.channels as usize;
+            match &out.pw {
+                Some(node) => {
+                    let refs: Vec<(Option<usize>, &[f32])> = sigs.iter().map(|(o, s)| (*o, s.as_slice())).collect();
+                    let frames = crate::audio::interleave(ch, &refs);
+                    players.push(crate::pwio::play_frames(node, self.fs, ch as u16, &frames, gi)?);
+                }
+                None => {
+                    let r = out.rate;
+                    let pad = vec![0.0f32; (0.05 * r as f32) as usize];
+                    let res: Vec<Vec<f32>> = sigs
+                        .iter()
+                        .map(|(_, s)| {
+                            let mut v = pad.clone();
+                            v.extend(resample(s, self.fs, r));
+                            v.extend(std::iter::repeat(0.0).take((listen_s * r as f32) as usize));
+                            v
+                        })
+                        .collect();
+                    let refs: Vec<(Option<usize>, &[f32])> = sigs.iter().zip(&res).map(|((o, _), v)| (*o, v.as_slice())).collect();
+                    let frames = crate::audio::interleave(ch, &refs);
+                    longest = longest.max(frames.len() as f32 / ch.max(1) as f32 / r as f32);
+                    let st = quiet(|| -> Result<Stream> {
+                        let s = crate::audio::build_output_frames(&out.dev, &out.cfg, out.fmt, Arc::new(frames), Arc::new(AtomicUsize::new(0)))?;
+                        s.play()?;
+                        Ok(s)
+                    })?;
+                    streams.push(st);
+                }
             }
         }
+        for p in players {
+            crate::pwio::wait_player(p)?;
+        }
+        std::thread::sleep(Duration::from_secs_f32(longest.max(listen_s) + 0.3));
+        drop(streams);
         std::thread::sleep(Duration::from_millis(20));
         drop(ins);
 
@@ -194,21 +238,24 @@ impl ArrayIo for CpalArray {
 // ------------------------------------------------------------------ simulator
 
 /// The user's layout as a perfect rectangle (first-order wall reflections via
-/// image sources) plus one person walking a slow loop. Each mic gets its own
-/// random driver latency, so the geometry anchoring is exercised for real.
+/// image sources) plus people walking slow loops. Each mic gets its own random
+/// driver latency, so the geometry anchoring is exercised for real.
 pub struct SimArray {
     l: Layout,
     fs: u32,
-    rng: u64,
-    pings: u64,
-    mic_lat: Vec<usize>,
-    pub walker: bool,
+    pub rng: u64,
+    pub pings: u64,
+    pub mic_lat: Vec<usize>,
+    /// How many people are walking (0 = empty room).
+    pub walkers: usize,
+    /// The room's true speed of sound (to exercise the self-calibration).
+    pub c: f32,
 }
 
 impl SimArray {
-    pub fn new(l: Layout, walker: bool) -> Self {
+    pub fn new(l: Layout, walkers: usize) -> Self {
         let n = l.mics().len();
-        let mut s = SimArray { l, fs: 48_000, rng: 0x51D3_A11C_E5EE_D001, pings: 0, mic_lat: vec![0; n], walker };
+        let mut s = SimArray { l, fs: 48_000, rng: 0x51D3_A11C_E5EE_D001, pings: 0, mic_lat: vec![0; n], walkers, c: SPEED_OF_SOUND };
         for i in 0..n {
             s.mic_lat[i] = 400 + (s.rand().abs() * 2400.0) as usize;
         }
@@ -223,10 +270,61 @@ impl SimArray {
         (v >> 40) as f32 / (1u64 << 23) as f32 - 1.0
     }
 
-    /// Where the simulated person is right now (a slow ellipse round the room).
-    pub fn walker_pos(&self) -> (f32, f32) {
+    /// Where simulated person `k` is right now (slow loops, the second one the other way round).
+    pub fn walker_pos(&self, k: usize) -> (f32, f32) {
         let t = self.pings as f32 * 0.05;
-        (self.l.width_m * (0.5 + 0.28 * t.cos()), self.l.depth_m * (0.45 + 0.25 * t.sin()))
+        let (w, d) = (self.l.width_m, self.l.depth_m);
+        if k == 0 {
+            (w * (0.5 + 0.28 * t.cos()), d * (0.45 + 0.25 * t.sin()))
+        } else {
+            let u = -t * 0.8 + 2.2;
+            (w * (0.5 + 0.3 * u.cos()), d * (0.55 + 0.28 * u.sin()))
+        }
+    }
+
+    /// Mic recordings for speakers (position, chirp) all sounding at once.
+    fn render(&mut self, sources: &[((f32, f32), &[f32])], listen_s: f32, volume: f32) -> Vec<Vec<f32>> {
+        let (w, d) = (self.l.width_m, self.l.depth_m);
+        let people: Vec<(f32, f32)> = (0..self.walkers).map(|k| self.walker_pos(k)).collect();
+        let mics: Vec<(f32, f32)> = self.l.mics().iter().map(|n| n.pos()).collect();
+        let (fs, c) = (self.fs, self.c);
+        let longest = sources.iter().map(|s| s.1.len()).max().unwrap_or(0);
+        let mut out = Vec::new();
+        for (i, m) in mics.iter().enumerate() {
+            let jitter = (self.rand().abs() * 120.0) as usize;
+            let lat = self.mic_lat[i] + jitter;
+            let len = lat + longest + (listen_s * fs as f32) as usize + 64;
+            let mut rec = vec![0.0f32; len];
+            for &(s, sig) in sources {
+                let add = |path: f32, amp: f32, rec: &mut Vec<f32>| {
+                    let at = lat + (path / c * fs as f32).round() as usize;
+                    for (k, &v) in sig.iter().enumerate() {
+                        if let Some(r) = rec.get_mut(at + k) {
+                            *r += v * amp * volume;
+                        }
+                    }
+                };
+                let dd = dist(s, *m);
+                add(dd, 1.0 / (0.3 + dd), &mut rec);
+                for im in [(-s.0, s.1), (2.0 * w - s.0, s.1), (s.0, -s.1), (s.0, 2.0 * d - s.1)] {
+                    let p = dist(im, *m);
+                    add(p, 0.35 / (0.3 + p), &mut rec);
+                }
+                for t in &people {
+                    let p = dist(s, *t) + dist(*t, *m);
+                    add(p, 0.6 / (0.3 + p), &mut rec);
+                }
+            }
+            for v in rec.iter_mut() {
+                *v += 0.002 * self.rand();
+            }
+            out.push(rec);
+        }
+        self.pings += 1;
+        if !cfg!(test) {
+            std::thread::sleep(Duration::from_millis(60)); // real-time-ish pacing
+        }
+        out
     }
 }
 
@@ -242,56 +340,32 @@ impl ArrayIo for SimArray {
             self.l.depth_m,
             self.l.speakers().len(),
             self.l.mics().len(),
-            if self.walker { " · someone walking" } else { "" }
+            match self.walkers {
+                0 => String::new(),
+                1 => " · someone walking".into(),
+                n => format!(" · {n} people walking"),
+            }
         )
     }
 
     fn ping(&mut self, spk: usize, sig: &[f32], listen_s: f32, volume: f32) -> Result<Vec<Vec<f32>>> {
         let s = self.l.speakers().get(spk).map(|n| n.pos()).context("no such speaker")?;
-        let (w, d) = (self.l.width_m, self.l.depth_m);
-        let images = [(-s.0, s.1), (2.0 * w - s.0, s.1), (s.0, -s.1), (s.0, 2.0 * d - s.1)];
-        let target = self.walker.then(|| self.walker_pos());
-        let mics: Vec<(f32, f32)> = self.l.mics().iter().map(|n| n.pos()).collect();
-        let fs = self.fs;
-        let mut out = Vec::new();
-        for (i, m) in mics.iter().enumerate() {
-            let jitter = (self.rand().abs() * 120.0) as usize;
-            let lat = self.mic_lat[i] + jitter;
-            let len = lat + sig.len() + (listen_s * fs as f32) as usize + 64;
-            let mut rec = vec![0.0f32; len];
-            let add = |path: f32, amp: f32, rec: &mut Vec<f32>| {
-                let at = lat + path_samples(path, fs).round() as usize;
-                for (k, &v) in sig.iter().enumerate() {
-                    if let Some(r) = rec.get_mut(at + k) {
-                        *r += v * amp * volume;
-                    }
-                }
-            };
-            let dd = dist(s, *m);
-            add(dd, 1.0 / (0.3 + dd), &mut rec);
-            for im in images {
-                let p = dist(im, *m);
-                add(p, 0.35 / (0.3 + p), &mut rec);
-            }
-            if let Some(t) = target {
-                let p = dist(s, t) + dist(t, *m);
-                add(p, 0.6 / (0.3 + p), &mut rec);
-            }
-            for v in rec.iter_mut() {
-                *v += 0.002 * self.rand();
-            }
-            out.push(rec);
-        }
-        self.pings += 1;
-        std::thread::sleep(Duration::from_millis(60)); // real-time-ish pacing
-        Ok(out)
+        Ok(self.render(&[(s, sig)], listen_s, volume))
+    }
+
+    fn ping_all(&mut self, sigs: &[Vec<f32>], listen_s: f32, volume: f32) -> Result<Vec<Vec<f32>>> {
+        let pos: Vec<(f32, f32)> = self.l.speakers().iter().map(|n| n.pos()).collect();
+        let sources: Vec<((f32, f32), &[f32])> = pos.into_iter().zip(sigs.iter().map(|v| v.as_slice())).collect();
+        Ok(self.render(&sources, listen_s, volume))
     }
 }
 
 // ------------------------------------------------------------------ pairs & imaging
 
-/// One speaker→mic pair's echo envelope, re-timed so index 0 is the instant the
-/// chirp left the speaker and normalised to the direct arrival.
+/// One speaker→mic pair's echo envelope, normalised to the direct arrival and
+/// re-timed so index 0 IS the direct arrival. An echo at index k travelled
+/// k/fs · c metres further than the direct path, so the speed of sound can be
+/// refined later without re-timing anything.
 #[derive(Clone, Debug)]
 pub struct PairEcho {
     pub s: (f32, f32),
@@ -300,45 +374,96 @@ pub struct PairEcho {
     pub env: Vec<f32>,
 }
 
-pub fn pair_from_recording(rec: &[f32], tpl: &[f32], s: (f32, f32), m: (f32, f32), fs: u32) -> Option<PairEcho> {
+pub fn pair_from_recording(rec: &[f32], tpl: &[f32], s: (f32, f32), m: (f32, f32)) -> Option<PairEcho> {
     let env = matched_envelope(rec, tpl);
     if env.is_empty() {
         return None;
     }
     let pk = argmax(&env);
     let peak = env[pk].max(1e-12);
-    let direct_m = dist(s, m);
-    let lag = path_samples(direct_m, fs).round() as usize;
-    let t0 = pk.checked_sub(lag)?;
-    Some(PairEcho { s, m, direct_m, env: env[t0..].iter().map(|v| v / peak).collect() })
+    Some(PairEcho { s, m, direct_m: dist(s, m), env: env[pk..].iter().map(|v| v / peak).collect() })
 }
 
-/// One full sweep: every speaker pings in turn, every mic listens; `avg` sweeps averaged.
-pub fn measure(io: &mut dyn ArrayIo, l: &Layout, tpl: &[f32], volume: f32, avg: usize) -> Result<Vec<PairEcho>> {
-    let fs = io.fs();
+/// How the speakers are driven for one frame.
+#[derive(Clone)]
+pub enum Codes {
+    /// One shared chirp; speakers take turns.
+    Sequential(Vec<f32>),
+    /// One code per speaker, all played at once.
+    Simultaneous(Vec<Vec<f32>>),
+}
+
+impl Codes {
+    pub fn for_layout(l: &Layout, fs: u32, f0: f32, f1: f32, simultaneous: bool) -> Self {
+        let n = l.speakers().len();
+        if simultaneous && n > 1 {
+            if let Some(v) = crate::settings::speaker_codes(fs, f0, f1, n, 0.01) {
+                return Codes::Simultaneous(v);
+            }
+        }
+        Codes::Sequential(dsp::chirp(fs, 0.01, f0, f1))
+    }
+
+    pub fn is_simultaneous(&self) -> bool {
+        matches!(self, Codes::Simultaneous(_))
+    }
+
+    /// How much to widen echoes before pairs vote (narrow-band codes already
+    /// have wider echoes).
+    pub fn dilate_m(&self) -> f32 {
+        if self.is_simultaneous() {
+            0.03
+        } else {
+            0.06
+        }
+    }
+}
+
+/// One frame: every speaker → every mic pair; `avg` frames averaged.
+pub fn measure(io: &mut dyn ArrayIo, l: &Layout, codes: &Codes, volume: f32, avg: usize) -> Result<Vec<PairEcho>> {
     let reach = l.width_m.hypot(l.depth_m) * 2.0 + 0.5;
     let listen = reach / SPEED_OF_SOUND + 0.05;
     let spk: Vec<(f32, f32)> = l.speakers().iter().map(|n| n.pos()).collect();
     let mic: Vec<(f32, f32)> = l.mics().iter().map(|n| n.pos()).collect();
     let mut acc: Vec<Option<PairEcho>> = vec![None; spk.len() * mic.len()];
+    let add = |k: usize, i: usize, p: PairEcho, acc: &mut Vec<Option<PairEcho>>| {
+        let slot = &mut acc[k * mic.len() + i];
+        match slot {
+            None => *slot = Some(p),
+            Some(a) => {
+                let n = a.env.len().min(p.env.len());
+                a.env.truncate(n);
+                for j in 0..n {
+                    a.env[j] += p.env[j];
+                }
+            }
+        }
+    };
     for _ in 0..avg.max(1) {
-        for (k, s) in spk.iter().enumerate() {
-            let recs = io.ping(k, tpl, listen, volume)?;
-            for (i, (rec, m)) in recs.iter().zip(&mic).enumerate() {
-                let Some(p) = pair_from_recording(rec, tpl, *s, *m, fs) else { continue };
-                let slot = &mut acc[k * mic.len() + i];
-                match slot {
-                    None => *slot = Some(p),
-                    Some(a) => {
-                        let n = a.env.len().min(p.env.len());
-                        a.env.truncate(n);
-                        for j in 0..n {
-                            a.env[j] += p.env[j];
+        match codes {
+            Codes::Sequential(tpl) => {
+                for (k, s) in spk.iter().enumerate() {
+                    let recs = io.ping(k, tpl, listen, volume)?;
+                    for (i, (rec, m)) in recs.iter().zip(&mic).enumerate() {
+                        if let Some(p) = pair_from_recording(rec, tpl, *s, *m) {
+                            add(k, i, p, &mut acc);
+                        }
+                    }
+                    if !cfg!(test) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+            Codes::Simultaneous(tpls) => {
+                let recs = io.ping_all(tpls, listen, volume)?;
+                for (k, (s, tpl)) in spk.iter().zip(tpls).enumerate() {
+                    for (i, (rec, m)) in recs.iter().zip(&mic).enumerate() {
+                        if let Some(p) = pair_from_recording(rec, tpl, *s, *m) {
+                            add(k, i, p, &mut acc);
                         }
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
     }
     let n = avg.max(1) as f32;
@@ -373,20 +498,43 @@ impl ArrayBackground {
         Self { per_pair }
     }
 
-    /// Each pair's |now − background|, plus the detection threshold (average of pairs).
-    pub fn subtract(&self, pairs: &[PairEcho], fs: u32, max_m: f32) -> (Vec<PairEcho>, f32) {
-        let mut th = 0.0;
+    /// Each pair's |now − background| and that pair's own detection threshold.
+    pub fn subtract(&self, pairs: &[PairEcho], fs: u32, max_m: f32) -> (Vec<PairEcho>, Vec<f32>) {
+        let mut th = Vec::new();
         let out: Vec<PairEcho> = pairs
             .iter()
             .zip(&self.per_pair)
             .map(|(p, b)| {
-                th += b.threshold(fs, 0.3, max_m);
+                th.push(b.threshold(fs, 0.3, max_m));
                 PairEcho { env: b.subtract(&as_profile(p, fs)).env, ..p.clone() }
             })
             .collect();
-        let n = out.len().max(1) as f32;
-        (out, th / n)
+        (out, th)
     }
+}
+
+/// Average several frames of the same pairs (e.g. the background capture).
+pub fn average_frames(frames: &[Vec<PairEcho>]) -> Vec<PairEcho> {
+    let Some(first) = frames.first() else { return Vec::new() };
+    first
+        .iter()
+        .enumerate()
+        .map(|(i, p0)| {
+            let n = frames.iter().filter_map(|f| f.get(i)).map(|p| p.env.len()).min().unwrap_or(0);
+            let mut env = vec![0.0f32; n];
+            let mut cnt = 0.0f32;
+            for f in frames {
+                if let Some(p) = f.get(i) {
+                    for j in 0..n {
+                        env[j] += p.env[j];
+                    }
+                    cnt += 1.0;
+                }
+            }
+            env.iter_mut().for_each(|v| *v /= cnt.max(1.0));
+            PairEcho { env, ..p0.clone() }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -417,38 +565,157 @@ impl Image {
     }
 }
 
-/// Paint each pair's echo energy along its ellipses and average over pairs.
+/// How pairs are combined into one picture.
+pub enum Fusion<'a> {
+    /// Average of all pairs (good for showing every reflector).
+    Sum,
+    /// Pairs must agree: geometric mean of each pair's evidence relative to its
+    /// own threshold. One pair alone can't light a spot, so ghosts where only
+    /// some curves cross fade away. 1.0 = every pair right at threshold.
+    Agree(&'a [f32]),
+}
+
+const AGREE_EPS: f32 = 0.08;
+
+/// Paint each pair's echo energy along its ellipses and combine the pairs.
 /// `guard_m`: ignore paths barely longer than the direct one (speaker ring-down).
-pub fn backproject(pairs: &[PairEcho], width_m: f32, depth_m: f32, cell: f32, fs: u32, guard_m: f32) -> Image {
+/// `c`: speed of sound in m/s.
+pub fn backproject(pairs: &[PairEcho], width_m: f32, depth_m: f32, cell: f32, fs: u32, guard_m: f32, c: f32, fusion: Fusion) -> Image {
     let nx = (width_m / cell).ceil().max(1.0) as usize;
     let ny = (depth_m / cell).ceil().max(1.0) as usize;
     let mut v = vec![0.0f32; nx * ny];
+    let per_m = fs as f32 / c;
+    let need = pairs.len().clamp(1, 2);
     if !pairs.is_empty() {
         for j in 0..ny {
             for i in 0..nx {
                 let p = ((i as f32 + 0.5) * cell, (j as f32 + 0.5) * cell);
-                let mut acc = 0.0;
-                for pr in pairs {
-                    let path = dist(pr.s, p) + dist(p, pr.m);
-                    if path - pr.direct_m < guard_m {
+                let (mut acc, mut logs, mut used) = (0.0f32, 0.0f32, 0usize);
+                for (n, pr) in pairs.iter().enumerate() {
+                    let excess = dist(pr.s, p) + dist(p, pr.m) - pr.direct_m;
+                    if excess < guard_m {
                         continue;
                     }
-                    let x = path_samples(path, fs);
+                    let x = excess * per_m;
                     let k = x.floor() as usize;
-                    if k + 1 < pr.env.len() {
-                        let f = x - k as f32;
-                        acc += pr.env[k] * (1.0 - f) + pr.env[k + 1] * f;
+                    if k + 1 >= pr.env.len() {
+                        continue;
+                    }
+                    let f = x - k as f32;
+                    let e = pr.env[k] * (1.0 - f) + pr.env[k + 1] * f;
+                    used += 1;
+                    match fusion {
+                        Fusion::Sum => acc += e,
+                        Fusion::Agree(th) => logs += (AGREE_EPS + e / th.get(n).copied().unwrap_or(1.0).max(1e-6)).ln(),
                     }
                 }
-                v[j * nx + i] = acc / pairs.len() as f32;
+                v[j * nx + i] = match fusion {
+                    Fusion::Sum => acc / pairs.len() as f32,
+                    Fusion::Agree(_) if used >= need => ((logs / used as f32).exp() - AGREE_EPS).max(0.0),
+                    Fusion::Agree(_) => 0.0,
+                };
             }
         }
     }
     Image { nx, ny, cell, v }
 }
 
-/// The chirp an array run uses: the calibrated band when there is one.
-pub fn template(fs: u32) -> (Vec<f32>, f32) {
+/// Find up to `max_n` people, one at a time ("explain away"): take the
+/// strongest spot every pair agrees on, remove that person's echo from every
+/// pair, and look again. Spots that only lit up because of the first person's
+/// curves vanish with them, so they can't come back as ghosts.
+/// Returns the first (full) picture and the people found as (x, y, score).
+pub fn detect_people(pairs: &[PairEcho], th: &[f32], width_m: f32, depth_m: f32, cell: f32, fs: u32, guard_m: f32, c: f32, dilate_m: f32, max_n: usize) -> (Image, Vec<(f32, f32, f32)>) {
+    const MIN_SCORE: f32 = 1.0;
+    const REMOVE_M: f32 = 0.12; // ± path length cleared around a found person's echo
+    // Widen each echo slightly (a body is ~30 cm deep and the layout is
+    // measured by hand) so pairs that are a few cm off still agree.
+    let r = (dilate_m * fs as f32 / c).round() as usize;
+    let pairs: Vec<PairEcho> = pairs
+        .iter()
+        .map(|p| {
+            let n = p.env.len();
+            let env = (0..n).map(|i| p.env[i.saturating_sub(r)..(i + r + 1).min(n)].iter().cloned().fold(0.0, f32::max)).collect();
+            PairEcho { env, ..p.clone() }
+        })
+        .collect();
+    let pairs = &pairs[..];
+    let first = backproject(pairs, width_m, depth_m, cell, fs, guard_m, c, Fusion::Agree(th));
+    let mut found = Vec::new();
+    let mut work: Vec<PairEcho> = pairs.to_vec();
+    let mut img = first.clone();
+    let mut first_score = 0.0;
+    for _ in 0..max_n {
+        let (x, y, v) = img.peak();
+        if v < MIN_SCORE || (first_score > 0.0 && v < 0.3 * first_score) {
+            break;
+        }
+        if found.is_empty() {
+            first_score = v;
+        }
+        found.push((x, y, v));
+        let per_m = fs as f32 / c;
+        for p in &mut work {
+            let e = dist(p.s, (x, y)) + dist((x, y), p.m) - p.direct_m;
+            let lo = ((e - REMOVE_M) * per_m).floor().max(0.0) as usize;
+            let hi = (((e + REMOVE_M) * per_m).ceil() as usize).min(p.env.len());
+            for v in &mut p.env[lo.min(hi)..hi] {
+                *v = 0.0;
+            }
+        }
+        img = backproject(&work, width_m, depth_m, cell, fs, guard_m, c, Fusion::Agree(th));
+    }
+    (first, found)
+}
+
+/// Fit the room's speed of sound: try values and keep the one that lines up
+/// every pair's echoes with the wall reflections the layout predicts.
+/// Returns (c in m/s, confidence ≥ 1; higher = clearer).
+pub fn fit_speed_of_sound(pairs: &[PairEcho], l: &Layout, fs: u32) -> Option<(f32, f32)> {
+    let (w, d) = (l.width_m, l.depth_m);
+    let mut excess: Vec<(usize, f32)> = Vec::new();
+    for (n, p) in pairs.iter().enumerate() {
+        let s = p.s;
+        for im in [(-s.0, s.1), (2.0 * w - s.0, s.1), (s.0, -s.1), (s.0, 2.0 * d - s.1)] {
+            let e = dist(im, p.m) - p.direct_m;
+            if e > 0.4 {
+                excess.push((n, e));
+            }
+        }
+    }
+    if excess.len() < 3 {
+        return None;
+    }
+    let score = |c: f32| -> f32 {
+        let per_m = fs as f32 / c;
+        excess
+            .iter()
+            .map(|&(n, e)| {
+                let env = &pairs[n].env;
+                let x = e * per_m;
+                let k = x.round() as usize;
+                // best value within ±1 sample (envelope peak is a few samples wide)
+                (k.saturating_sub(1)..=k + 1).filter_map(|i| env.get(i)).cloned().fold(0.0, f32::max)
+            })
+            .sum()
+    };
+    let cands: Vec<(f32, f32)> = (0..=140).map(|i| 325.0 + i as f32 * 0.25).map(|c| (c, score(c))).collect();
+    let best = cands.iter().cloned().fold((0.0, f32::MIN), |a, b| if b.1 > a.1 { b } else { a });
+    let mut sorted: Vec<f32> = cands.iter().map(|c| c.1).collect();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let median = sorted[sorted.len() / 2].max(1e-9);
+    let conf = best.1 / median;
+    (conf > 1.15).then_some((best.0, conf))
+}
+
+/// Air temperature implied by a speed of sound (dry air).
+pub fn temperature_c(c: f32) -> f32 {
+    273.15 * ((c / 331.3).powi(2) - 1.0)
+}
+
+/// The chirp band and volume an array run uses: the calibrated band (or the
+/// silent band in silent mode).
+pub fn band_and_volume(fs: u32) -> (f32, f32, f32) {
     let (f0, f1, vol) = crate::audio::CpalSonar::open(None, None)
         .ok()
         .and_then(|s| {
@@ -456,7 +723,8 @@ pub fn template(fs: u32) -> (Vec<f32>, f32) {
             crate::calib::load(&s.name()).filter(|p| p.fs == fs).map(|p| (p.f0, p.f1, p.volume))
         })
         .unwrap_or((3000.0, (0.45 * fs as f32).min(16_000.0), 0.7));
-    (dsp::chirp(fs, 0.01, f0, f1), vol)
+    let (f0, f1) = crate::settings::band(fs, f0, f1);
+    (f0, f1, vol)
 }
 
 #[cfg(test)]
@@ -481,21 +749,21 @@ mod tests {
     fn array_locates_a_walking_person_in_2d() {
         let l = two_by_two();
         let fs = 48_000;
-        let tpl = dsp::chirp(fs, 0.01, 3000.0, 16_000.0);
+        let tpl = Codes::Sequential(dsp::chirp(fs, 0.01, 3000.0, 16_000.0));
         // Empty room first.
-        let mut still = SimArray::new(l.clone(), false);
+        let mut still = SimArray::new(l.clone(), 0);
         let frames: Vec<Vec<PairEcho>> = (0..4).map(|_| measure(&mut still, &l, &tpl, 0.7, 1).unwrap()).collect();
         assert_eq!(frames[0].len(), 4, "2 speakers × 2 mics = 4 pairs");
         let bg = ArrayBackground::capture(&frames, fs);
         // Then someone walks in.
-        let mut sim = SimArray::new(l.clone(), true);
+        let mut sim = SimArray::new(l.clone(), 1);
         sim.rng = still.rng;
         sim.mic_lat = still.mic_lat.clone();
         sim.pings = 37;
-        let truth = sim.walker_pos();
+        let truth = sim.walker_pos(0);
         let pairs = measure(&mut sim, &l, &tpl, 0.7, 1).unwrap();
         let (diff, _) = bg.subtract(&pairs, fs, 10.0);
-        let img = backproject(&diff, l.width_m, l.depth_m, 0.05, fs, 0.3);
+        let img = backproject(&diff, l.width_m, l.depth_m, 0.05, fs, 0.3, SPEED_OF_SOUND, Fusion::Sum);
         let (x, y, _) = img.peak();
         let err = dist((x, y), truth);
         assert!(err < 0.2, "found ({x:.2},{y:.2}), truth ({:.2},{:.2}), err {err:.2} m", truth.0, truth.1);

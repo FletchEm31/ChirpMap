@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::array::{self, ArrayBackground, ArrayIo, CpalArray, Image, SimArray};
+use crate::tracker::{Track, Tracker};
 use crate::layout::{self as plan, Kind, Node};
 use ratatui::crossterm::event::KeyEvent;
 use std::collections::VecDeque;
@@ -37,6 +38,8 @@ pub(super) struct Ping {
     pub x: f32,
     pub y: f32,
     pub age: f32,
+    /// Which person (0 = untracked).
+    pub id: u32,
 }
 
 const RING_S: f32 = 1.2; // how long a ping's ring keeps expanding
@@ -155,7 +158,13 @@ fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, p
     // detections stay as a fading red trail; the newest is a solid red ◉.
     let mut ringed: Vec<&Ping> = pings.iter().filter(|p| p.age < RING_S).collect();
     ringed.sort_by(|a, b| a.age.total_cmp(&b.age));
-    for p in ringed.into_iter().take(2) {
+    let mut ringed_ids: Vec<u32> = Vec::new();
+    ringed.retain(|p| {
+        let fresh = !ringed_ids.contains(&p.id);
+        ringed_ids.push(p.id);
+        fresh
+    });
+    for p in ringed.into_iter().take(4) {
         let radius = 0.12 + p.age / RING_S * 0.75;
         let t = 1.0 - p.age / RING_S;
         for (r, row) in grid.iter_mut().enumerate() {
@@ -164,18 +173,35 @@ fn draw_plan(f: &mut Frame, area: Rect, l: &plan::Layout, img: Option<&Image>, p
                 let y = l.depth_m - (r as f32 + 0.5) * s;
                 if (plan::dist((x, y), (p.x, p.y)) - radius).abs() < s * 0.45 {
                     cell.0 = "∘".into();
-                    cell.1 = cell.1.fg(fade((255, 77, 77), t)).add_modifier(Modifier::BOLD);
+                    cell.1 = cell.1.fg(fade(person_rgb(p.id), t)).add_modifier(Modifier::BOLD);
                 }
             }
         }
     }
-    let newest = pings.iter().map(|p| p.age).fold(f32::MAX, f32::min);
-    for p in pings.iter().filter(|p| p.age < TRAIL_S) {
+    let mut trail: Vec<&Ping> = pings.iter().filter(|p| p.age < TRAIL_S).collect();
+    trail.sort_by(|a, b| b.age.total_cmp(&a.age)); // oldest first, newest drawn on top
+    for p in &trail {
         let (r, c) = to_cell(p.x, p.y);
-        if p.age == newest && p.age < 0.8 {
-            grid[r][c] = ("◉".into(), Style::new().fg(RED).bg(NAVY).add_modifier(Modifier::BOLD));
-        } else {
-            grid[r][c] = ("•".into(), Style::new().fg(fade((255, 120, 120), 1.0 - p.age / TRAIL_S)).bg(NAVY));
+        let (cr, cg, cb) = person_rgb(p.id);
+        let soft = (cr.saturating_add(0).max(120), cg.saturating_add(43), cb.saturating_add(43));
+        grid[r][c] = ("•".into(), Style::new().fg(fade(soft, 1.0 - p.age / TRAIL_S)).bg(NAVY));
+    }
+    // Each person's newest position: a solid ◉ in their colour, with their ID next to it.
+    let mut seen: Vec<u32> = Vec::new();
+    for p in trail.iter().rev() {
+        if seen.contains(&p.id) || p.age >= 0.8 {
+            continue;
+        }
+        seen.push(p.id);
+        let (r, c) = to_cell(p.x, p.y);
+        let st = Style::new().fg(person_color(p.id)).bg(NAVY).add_modifier(Modifier::BOLD);
+        grid[r][c] = ("◉".into(), st);
+        if p.id > 0 {
+            for (j, ch) in p.id.to_string().chars().enumerate() {
+                if let Some(cell) = grid[r].get_mut(c + 1 + j) {
+                    *cell = (ch.to_string(), st);
+                }
+            }
         }
     }
     let lines: Vec<Line> = grid
@@ -421,13 +447,19 @@ pub(super) fn draw_designer(f: &mut Frame, left: Rect, right: Rect, d: &Designer
 enum AMsg {
     Status(String),
     Desc(String),
-    Frame { img: Image, peak: (f32, f32, f32), detected: bool },
+    /// Speed of sound in use, and whether it was measured in this room.
+    Speed { c: f32, fitted: bool },
+    Mode { simultaneous: bool, silent: bool },
+    Frame { img: Image, peak: (f32, f32, f32), detected: bool, tracks: Vec<Track> },
+    Recording(Option<(String, usize)>),
     Error(String),
 }
 
 pub(super) struct ArrayView {
     pub diff: bool,
     stop: Arc<AtomicBool>,
+    /// Shared with the worker: true while frames are being saved.
+    pub rec: Arc<AtomicBool>,
     rx: Receiver<AMsg>,
     handle: Option<JoinHandle<()>>,
     l: plan::Layout,
@@ -436,10 +468,15 @@ pub(super) struct ArrayView {
     img: Option<Image>,
     peak: Option<(f32, f32, f32)>,
     detected: bool,
+    tracks: Vec<Track>,
     frames: u64,
+    started: Instant,
+    speed: Option<(f32, bool)>,
+    mode: Option<(bool, bool)>,
+    rec_info: Option<(String, usize)>,
     error: Option<String>,
-    /// Recent movement detections for the radar view.
-    pings: VecDeque<((f32, f32), Instant)>,
+    /// Recent detections for the radar view: (person ID, position, when).
+    pings: VecDeque<(u32, (f32, f32), Instant)>,
 }
 
 impl Drop for ArrayView {
@@ -468,6 +505,22 @@ impl Backend {
 const GUARD_M: f32 = 0.3;
 const GUARD_DIFF_M: f32 = 0.6;
 const CELL_M: f32 = 0.05;
+const MAX_PEOPLE: usize = 4;
+
+/// Colour per person: 1 red, 2 orange, 3 magenta, 4 green.
+pub(super) fn person_rgb(id: u32) -> (u8, u8, u8) {
+    match id {
+        0 | 1 => (255, 77, 77),
+        2 => (255, 168, 64),
+        3 => (230, 102, 255),
+        _ => (120, 230, 150),
+    }
+}
+
+fn person_color(id: u32) -> Color {
+    let (r, g, b) = person_rgb(id);
+    Color::Rgb(r, g, b)
+}
 
 impl ArrayView {
     pub fn start(diff: bool) -> std::result::Result<Self, String> {
@@ -476,16 +529,18 @@ impl ArrayView {
             return Err("The saved room needs at least one speaker and one mic (7 Room designer).".into());
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let rec = Arc::new(AtomicBool::new(false));
         let (tx, rx) = channel();
-        let (l2, stop2) = (l.clone(), stop.clone());
+        let (l2, stop2, rec2) = (l.clone(), stop.clone(), rec.clone());
         let handle = std::thread::spawn(move || {
-            if let Err(e) = run_array(l2, diff, stop2, &tx) {
+            if let Err(e) = run_array(l2, diff, stop2, rec2, &tx) {
                 let _ = tx.send(AMsg::Error(format!("{e:#}")));
             }
         });
         Ok(ArrayView {
             diff,
             stop,
+            rec,
             rx,
             handle: Some(handle),
             l,
@@ -494,10 +549,24 @@ impl ArrayView {
             img: None,
             peak: None,
             detected: false,
+            tracks: Vec::new(),
             frames: 0,
+            started: Instant::now(),
+            speed: None,
+            mode: None,
+            rec_info: None,
             error: None,
             pings: VecDeque::new(),
         })
+    }
+
+    pub fn toggle_recording(&mut self) {
+        let on = !self.rec.load(Ordering::SeqCst);
+        self.rec.store(on, Ordering::SeqCst);
+    }
+
+    pub fn recording(&self) -> bool {
+        self.rec.load(Ordering::SeqCst)
     }
 
     pub fn drain(&mut self) {
@@ -505,46 +574,85 @@ impl ArrayView {
             match m {
                 AMsg::Status(s) => self.status = s,
                 AMsg::Desc(s) => self.desc = s,
-                AMsg::Frame { img, peak, detected } => {
+                AMsg::Speed { c, fitted } => self.speed = Some((c, fitted)),
+                AMsg::Mode { simultaneous, silent } => self.mode = Some((simultaneous, silent)),
+                AMsg::Recording(r) => self.rec_info = r,
+                AMsg::Frame { img, peak, detected, tracks } => {
                     self.frames += 1;
                     self.img = Some(img);
                     self.peak = Some(peak);
                     self.detected = detected;
-                    let pairs = self.l.speakers().len() * self.l.mics().len();
-                    // One ping per ~⅓ s keeps the radar readable at any frame rate.
-                    let due = self.pings.back().map_or(true, |(_, t)| t.elapsed().as_secs_f32() >= PING_GAP_S);
-                    if self.diff && detected && pairs >= 2 && due {
-                        self.pings.push_back(((peak.0, peak.1), Instant::now()));
+                    // One ping per person per ~⅓ s keeps the radar readable at any frame rate.
+                    if self.diff {
+                        for tr in &tracks {
+                            let due = self
+                                .pings
+                                .iter()
+                                .rev()
+                                .find(|p| p.0 == tr.id)
+                                .map_or(true, |p| p.2.elapsed().as_secs_f32() >= PING_GAP_S);
+                            if due {
+                                self.pings.push_back((tr.id, (tr.x, tr.y), Instant::now()));
+                            }
+                        }
                     }
+                    self.tracks = tracks;
                 }
                 AMsg::Error(e) => self.error = Some(e),
             }
         }
-        while self.pings.front().is_some_and(|(_, t)| t.elapsed().as_secs_f32() > TRAIL_S) {
+        while self.pings.front().is_some_and(|p| p.2.elapsed().as_secs_f32() > TRAIL_S) {
             self.pings.pop_front();
         }
-        while self.pings.len() > TRAIL_N {
+        while self.pings.len() > TRAIL_N * MAX_PEOPLE {
             self.pings.pop_front();
         }
     }
 }
 
-fn run_array(l: plan::Layout, diff: bool, stop: Arc<AtomicBool>, tx: &Sender<AMsg>) -> Result<()> {
-    let mut be = if sim_mode() { Backend::Sim(SimArray::new(l.clone(), false)) } else { Backend::Real(CpalArray::open(&l)?) };
+fn run_array(l: plan::Layout, diff: bool, stop: Arc<AtomicBool>, rec: Arc<AtomicBool>, tx: &Sender<AMsg>) -> Result<()> {
+    let sim = sim_mode();
+    let mut be = if sim {
+        let mut s = SimArray::new(l.clone(), 0);
+        s.c = 346.0; // a warm room (~25 °C), so the self-check has something to find
+        Backend::Sim(s)
+    } else {
+        Backend::Real(CpalArray::open(&l)?)
+    };
     let fs = be.io().fs();
-    let (tpl, vol) = if sim_mode() { (dsp::chirp(fs, 0.01, 3000.0, 16_000.0), 0.7) } else { array::template(fs) };
+    let cfg = crate::settings::load();
+    let (f0, f1, vol) = if sim {
+        let (a, b) = crate::settings::band(fs, 3000.0, 16_000.0);
+        (a, b, 0.7)
+    } else {
+        array::band_and_volume(fs)
+    };
+    let codes = array::Codes::for_layout(&l, fs, f0, f1, cfg.simultaneous);
     let _ = tx.send(AMsg::Desc(be.io().describe()));
-    let bg = if diff {
-        let _ = tx.send(AMsg::Status("Capturing the empty room — keep still and out of the way…".into()));
-        let mut frames = Vec::new();
-        for _ in 0..5 {
-            if stop.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            frames.push(array::measure(be.io(), &l, &tpl, vol, 1)?);
+    let _ = tx.send(AMsg::Mode { simultaneous: codes.is_simultaneous(), silent: cfg.silent });
+
+    // A few frames of the room as it is: the background (tracker mode) and the
+    // speed-of-sound self-check (walls are where the layout says they are).
+    let _ = tx.send(AMsg::Status(if diff {
+        "Capturing the empty room — keep still and out of the way…".into()
+    } else {
+        "Listening to the room…".into()
+    }));
+    let mut frames = Vec::new();
+    for _ in 0..5 {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(());
         }
+        frames.push(array::measure(be.io(), &l, &codes, vol, 1)?);
+    }
+    let (c, fitted) = match array::fit_speed_of_sound(&array::average_frames(&frames), &l, fs) {
+        Some((c, _)) => (c, true),
+        None => (dsp::SPEED_OF_SOUND, false),
+    };
+    let _ = tx.send(AMsg::Speed { c, fitted });
+    let bg = if diff {
         if let Backend::Sim(s) = &mut be {
-            s.walker = true;
+            s.walkers = 2;
         }
         let _ = tx.send(AMsg::Status("Background captured — walk around the room.".into()));
         Some(ArrayBackground::capture(&frames, fs))
@@ -552,34 +660,94 @@ fn run_array(l: plan::Layout, diff: bool, stop: Arc<AtomicBool>, tx: &Sender<AMs
         let _ = tx.send(AMsg::Status("Showing every reflector the array hears.".into()));
         None
     };
+
     let max_m = l.width_m.hypot(l.depth_m) * 2.0;
+    let mut tracker = Tracker::new();
+    let t0 = Instant::now();
+    let mut recorder: Option<crate::session::Recorder> = None;
     while !stop.load(Ordering::SeqCst) {
-        let pairs = array::measure(be.io(), &l, &tpl, vol, 1)?;
-        let (pairs, th) = match &bg {
-            Some(b) => b.subtract(&pairs, fs, max_m),
-            None => (pairs, 0.0),
+        let pairs = array::measure(be.io(), &l, &codes, vol, 1)?;
+        let t = t0.elapsed().as_secs_f64();
+        let (img, peak, detected, tracks) = match &bg {
+            Some(b) => {
+                let (pairs, th) = b.subtract(&pairs, fs, max_m);
+                // Pairs must agree: a spot only lights up if every pair hears something there.
+                // Pairs must agree, and each person found is explained away before looking for the next.
+                let (img, cands) = array::detect_people(&pairs, &th, l.width_m, l.depth_m, CELL_M, fs, GUARD_DIFF_M, c, codes.dilate_m(), MAX_PEOPLE);
+                let tracks = tracker.update(t, &cands);
+                let peak = img.peak();
+                (img, peak, !tracks.is_empty(), tracks)
+            }
+            None => {
+                let img = array::backproject(&pairs, l.width_m, l.depth_m, CELL_M, fs, GUARD_M, c, array::Fusion::Sum);
+                let peak = img.peak();
+                (img, peak, true, Vec::new())
+            }
         };
-        // Movers: a wider guard so leftover speaker ringing next to the devices isn't "someone".
-        let guard = if diff { GUARD_DIFF_M } else { GUARD_M };
-        let img = array::backproject(&pairs, l.width_m, l.depth_m, CELL_M, fs, guard);
-        let peak = img.peak();
-        let detected = !diff || peak.2 > th;
-        if tx.send(AMsg::Frame { img, peak, detected }).is_err() {
+
+        // Recording on/off follows the 'v' key.
+        match (rec.load(Ordering::SeqCst), recorder.is_some()) {
+            (true, false) => {
+                let h = crate::session::Header {
+                    version: 1,
+                    started_unix: crate::session::now_unix(),
+                    layout: l.clone(),
+                    speed_of_sound: c,
+                    silent: cfg.silent,
+                    simultaneous: codes.is_simultaneous(),
+                    diff,
+                };
+                match crate::session::Recorder::start(&h) {
+                    Ok(r) => recorder = Some(r),
+                    Err(e) => {
+                        rec.store(false, Ordering::SeqCst);
+                        let _ = tx.send(AMsg::Status(format!("Couldn't start recording: {e:#}")));
+                    }
+                }
+            }
+            (false, true) => {
+                if let Some(r) = recorder.take() {
+                    let _ = tx.send(AMsg::Status(format!("Saved {} frames to {}", r.frames, r.path.display())));
+                }
+                let _ = tx.send(AMsg::Recording(None));
+            }
+            _ => {}
+        }
+        if let Some(r) = &mut recorder {
+            let _ = r.push(&crate::session::FrameRec::new(t as f32, &img, &tracks));
+            let _ = tx.send(AMsg::Recording(Some((r.path.display().to_string(), r.frames))));
+        }
+
+        if tx.send(AMsg::Frame { img, peak, detected, tracks }).is_err() {
             break;
         }
     }
     Ok(())
 }
 
+fn speed_line(c: f32, fitted: bool) -> String {
+    if fitted {
+        format!("speed of sound {c:.1} m/s (≈ {:.0} °C, checked against your walls)", array::temperature_c(c))
+    } else {
+        format!("speed of sound {c:.0} m/s (default — walls not clear enough to check)")
+    }
+}
+
 pub(super) fn draw_array(f: &mut Frame, area: Rect, a: &ArrayView) {
     let title = if a.diff { " ARRAY TRACKER · 2D · radar " } else { " ARRAY · 2D · every reflector " };
-    let pings: Vec<Ping> = a.pings.iter().map(|((x, y), t)| Ping { x: *x, y: *y, age: t.elapsed().as_secs_f32() }).collect();
+    let pings: Vec<Ping> = a.pings.iter().map(|(id, (x, y), t)| Ping { x: *x, y: *y, age: t.elapsed().as_secs_f32(), id: *id }).collect();
     let alert = pings.iter().any(|p| p.age < 0.35);
+    let fps = a.frames as f32 / a.started.elapsed().as_secs_f32().max(0.5);
+    let mut right = vec![Span::styled(format!(" {} frames · {:.1}/s ", a.frames, fps), Style::new().fg(DIM))];
+    if a.recording() {
+        let n = a.rec_info.as_ref().map_or(0, |r| r.1);
+        right.insert(0, Span::styled(format!(" ● REC {n} "), Style::new().fg(RED).add_modifier(Modifier::BOLD)));
+    }
     let block = Block::bordered()
         .border_type(BorderType::Plain)
         .border_style(Style::new().fg(if alert { RED } else { LINE }))
         .title(Span::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
-        .title(Line::from(Span::styled(format!(" {} frames ", a.frames), Style::new().fg(DIM))).alignment(Alignment::Right));
+        .title(Line::from(right).alignment(Alignment::Right));
     let inner = block.inner(area);
     f.render_widget(block, area);
     if let Some(e) = &a.error {
@@ -595,41 +763,231 @@ pub(super) fn draw_array(f: &mut Frame, area: Rect, a: &ArrayView) {
         );
         return;
     }
-    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4)]).split(inner);
+    let parts = Layout::vertical([Constraint::Length(4), Constraint::Min(4)]).split(inner);
     let pairs = a.l.speakers().len() * a.l.mics().len();
     let centre = {
         let n = a.l.nodes.len().max(1) as f32;
         (a.l.nodes.iter().map(|n| n.x).sum::<f32>() / n, a.l.nodes.iter().map(|n| n.y).sum::<f32>() / n)
     };
-    let (head, col) = match (a.peak, a.detected) {
-        (Some((x, y, _)), true) if pairs < 2 => (
-            format!("◯ ≈ {} from the desk — 1 pair gives distance only; add a 2nd mic (7) for a 2D fix", fmt_len(plan::dist((x, y), centre))),
-            HIT,
-        ),
-        (Some((x, y, _)), true) if a.diff => (
-            format!("● MOVEMENT · {} across · {} up the plan", fmt_len(x), fmt_len(y)),
-            RED,
-        ),
-        (Some((x, y, _)), true) => (
-            format!("◉ strongest reflector · {} across · {} up the plan", fmt_len(x), fmt_len(y)),
-            HIT,
-        ),
-        (Some(_), false) => ("· nothing moving ·".to_string(), DIM),
-        (None, _) => (a.status.clone(), DIM),
+    let head: Line = if a.diff && pairs >= 2 {
+        if a.tracks.is_empty() {
+            Line::from(Span::styled(if a.peak.is_some() { "· nothing moving ·".to_string() } else { a.status.clone() }, Style::new().fg(DIM)))
+        } else {
+            let mut spans = vec![Span::styled(
+                format!("● {} {} · ", a.tracks.len(), if a.tracks.len() == 1 { "PERSON" } else { "PEOPLE" }),
+                Style::new().fg(RED).add_modifier(Modifier::BOLD),
+            )];
+            for (k, tr) in a.tracks.iter().enumerate() {
+                if k > 0 {
+                    spans.push(Span::raw("   "));
+                }
+                spans.push(Span::styled(
+                    format!("#{} {} across, {} up", tr.id, fmt_len(tr.x), fmt_len(tr.y)),
+                    Style::new().fg(person_color(tr.id)).add_modifier(Modifier::BOLD),
+                ));
+            }
+            Line::from(spans)
+        }
+    } else {
+        let (text, col) = match (a.peak, a.detected) {
+            (Some((x, y, _)), true) if pairs < 2 => (
+                format!("◯ ≈ {} from the desk — 1 pair gives distance only; add a 2nd mic (7) for a 2D fix", fmt_len(plan::dist((x, y), centre))),
+                HIT,
+            ),
+            (Some((x, y, _)), true) => (format!("◉ strongest reflector · {} across · {} up the plan", fmt_len(x), fmt_len(y)), HIT),
+            (Some(_), false) => ("· nothing moving ·".to_string(), DIM),
+            (None, _) => (a.status.clone(), DIM),
+        };
+        Line::from(Span::styled(text, Style::new().fg(col).add_modifier(Modifier::BOLD)))
     };
+    let mut info = Vec::new();
+    if let Some((c, fitted)) = a.speed {
+        info.push(speed_line(c, fitted));
+    }
+    if let Some((sim, silent)) = a.mode {
+        info.push(format!("{} · {}", if sim { "all speakers at once" } else { "speakers take turns" }, if silent { "silent 18–21 kHz" } else { "audible band" }));
+    }
     f.render_widget(
         Paragraph::new(vec![
-            Line::from(Span::styled(head, Style::new().fg(col).add_modifier(Modifier::BOLD))).alignment(Alignment::Center),
+            head.alignment(Alignment::Center),
             Line::from(Span::styled(a.status.clone(), Style::new().fg(DIM))).alignment(Alignment::Center),
+            Line::from(Span::styled(info.join(" · "), Style::new().fg(DIM))).alignment(Alignment::Center),
             Line::from(Span::styled(a.desc.clone(), Style::new().fg(FAINT))).alignment(Alignment::Center),
         ]),
         parts[0],
     );
     // "Every reflector" mode has no pings; show its strongest reflector as one.
     let shown: Vec<Ping> = match (a.diff, a.peak, a.detected) {
-        (false, Some((x, y, _)), true) if pairs >= 2 => vec![Ping { x, y, age: 0.0 }],
+        (false, Some((x, y, _)), true) if pairs >= 2 => vec![Ping { x, y, age: 0.0, id: 0 }],
         (false, _, _) => Vec::new(),
         _ => pings,
     };
     draw_plan(f, parts[1], &a.l, a.img.as_ref(), &shown, None, room_title(&a.l), alert);
+}
+
+// ------------------------------------------------------------------ replay
+
+pub(super) struct Replay {
+    files: Vec<std::path::PathBuf>,
+    which: usize,
+    s: Option<crate::session::Session>,
+    pos: usize,
+    playing: bool,
+    speed: f32,
+    /// Session time shown at the last tick, and when that was.
+    clock: (f32, Instant),
+    error: Option<String>,
+}
+
+impl Replay {
+    pub fn new() -> Self {
+        let files = crate::session::list();
+        let mut r = Replay { files, which: 0, s: None, pos: 0, playing: true, speed: 1.0, clock: (0.0, Instant::now()), error: None };
+        r.open();
+        r
+    }
+
+    fn open(&mut self) {
+        self.pos = 0;
+        self.s = None;
+        self.error = None;
+        match self.files.get(self.which) {
+            None => self.error = Some(format!("No recorded sessions yet. In 8 Array tracker press v to record; files go to {}.", crate::session::dir().display())),
+            Some(p) => match crate::session::load(p) {
+                Ok(s) if s.frames.is_empty() => self.error = Some(format!("{} has no frames.", p.display())),
+                Ok(s) => self.s = Some(s),
+                Err(e) => self.error = Some(format!("{e:#}")),
+            },
+        }
+        self.clock = (self.now_t(), Instant::now());
+    }
+
+    fn now_t(&self) -> f32 {
+        self.s.as_ref().and_then(|s| s.frames.get(self.pos)).map_or(0.0, |f| f.t)
+    }
+
+    fn seek(&mut self, pos: usize) {
+        if let Some(s) = &self.s {
+            self.pos = pos.min(s.frames.len().saturating_sub(1));
+        }
+        self.clock = (self.now_t(), Instant::now());
+    }
+
+    /// Advance in real time while playing.
+    pub fn tick(&mut self) {
+        let Some(s) = &self.s else { return };
+        if !self.playing {
+            return;
+        }
+        let target = self.clock.0 + self.clock.1.elapsed().as_secs_f32() * self.speed;
+        while self.pos + 1 < s.frames.len() && s.frames[self.pos + 1].t <= target {
+            self.pos += 1;
+        }
+        if self.pos + 1 >= s.frames.len() {
+            self.playing = false;
+        }
+    }
+
+    /// Returns true when the viewer should close.
+    pub fn key(&mut self, k: KeyEvent) -> bool {
+        let n = self.s.as_ref().map_or(0, |s| s.frames.len());
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => return true,
+            KeyCode::Char(' ') => {
+                if self.pos + 1 >= n {
+                    self.seek(0);
+                }
+                self.playing = !self.playing;
+                self.clock = (self.now_t(), Instant::now());
+            }
+            KeyCode::Right => {
+                self.playing = false;
+                self.seek(self.pos + 1);
+            }
+            KeyCode::Left => {
+                self.playing = false;
+                self.seek(self.pos.saturating_sub(1));
+            }
+            KeyCode::PageUp => self.seek(self.pos.saturating_sub(30)),
+            KeyCode::PageDown => self.seek(self.pos + 30),
+            KeyCode::Home => self.seek(0),
+            KeyCode::End => self.seek(n),
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.speed = (self.speed * 2.0).min(8.0);
+                self.clock = (self.now_t(), Instant::now());
+            }
+            KeyCode::Char('-') => {
+                self.speed = (self.speed / 2.0).max(0.25);
+                self.clock = (self.now_t(), Instant::now());
+            }
+            KeyCode::Char('[') | KeyCode::Up if self.which + 1 < self.files.len() => {
+                self.which += 1; // older
+                self.open();
+            }
+            KeyCode::Char(']') | KeyCode::Down if self.which > 0 => {
+                self.which -= 1; // newer
+                self.open();
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+pub(super) fn draw_replay(f: &mut Frame, area: Rect, r: &Replay) {
+    let name = r.files.get(r.which).and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let block = Block::bordered()
+        .border_type(BorderType::Plain)
+        .border_style(Style::new().fg(LINE))
+        .title(Span::styled(" REPLAY ", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
+        .title(Line::from(Span::styled(format!(" {name} · {}/{} ", r.which + 1, r.files.len().max(1)), Style::new().fg(DIM))).alignment(Alignment::Right));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let Some(s) = &r.s else {
+        f.render_widget(Paragraph::new(r.error.clone().unwrap_or_default()).style(Style::new().fg(DIM)).wrap(Wrap { trim: true }), inner);
+        return;
+    };
+    let parts = Layout::vertical([Constraint::Length(3), Constraint::Min(4)]).split(inner);
+    let fr = &s.frames[r.pos];
+    let total = s.frames.last().map_or(0.0, |f| f.t);
+    let width = parts[0].width.saturating_sub(24).max(10) as usize;
+    let at = if total > 0.0 { ((fr.t / total) * (width - 1) as f32).round() as usize } else { 0 };
+    let bar: String = (0..width).map(|i| if i == at { '◆' } else if i < at { '━' } else { '─' }).collect();
+    let mut people: Vec<Span> = vec![Span::styled(if r.playing { "▶ " } else { "❚❚ " }, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))];
+    if fr.tracks.is_empty() {
+        people.push(Span::styled("nobody moving", Style::new().fg(DIM)));
+    }
+    for (k, tr) in fr.tracks.iter().enumerate() {
+        if k > 0 {
+            people.push(Span::raw("   "));
+        }
+        people.push(Span::styled(format!("#{} {} across, {} up", tr.id, fmt_len(tr.x), fmt_len(tr.y)), Style::new().fg(person_color(tr.id)).add_modifier(Modifier::BOLD)));
+    }
+    let clock = |t: f32| format!("{}:{:04.1}", (t / 60.0) as u32, t % 60.0);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(people).alignment(Alignment::Center),
+            Line::from(vec![
+                Span::styled(format!("{} ", clock(fr.t)), Style::new().fg(LINE)),
+                Span::styled(bar, Style::new().fg(ACCENT)),
+                Span::styled(format!(" {} · {}×", clock(total), r.speed), Style::new().fg(DIM)),
+            ])
+            .alignment(Alignment::Center),
+            Line::from(Span::styled(
+                format!("frame {}/{} · {}", r.pos + 1, s.frames.len(), speed_line(s.header.speed_of_sound, true)),
+                Style::new().fg(FAINT),
+            ))
+            .alignment(Alignment::Center),
+        ]),
+        parts[0],
+    );
+    // Trails: where each person was over the last few seconds of the recording.
+    let mut pings = Vec::new();
+    for back in s.frames[..=r.pos].iter().rev().take_while(|b| fr.t - b.t < TRAIL_S) {
+        for tr in &back.tracks {
+            pings.push(Ping { x: tr.x, y: tr.y, age: fr.t - back.t, id: tr.id });
+        }
+    }
+    let img = fr.image();
+    draw_plan(f, parts[1], &s.header.layout, Some(&img), &pings, None, room_title(&s.header.layout), false);
 }

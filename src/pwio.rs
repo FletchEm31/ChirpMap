@@ -45,6 +45,43 @@ fn write_wav(path: &PathBuf, fs: u32, channels: u16, only: Option<usize>, sig: &
     Ok(())
 }
 
+/// Write already-interleaved float frames as a WAV.
+fn write_wav_frames(path: &PathBuf, fs: u32, channels: u16, frames: &[f32]) -> Result<()> {
+    let ch = channels.max(1) as usize;
+    let data_len = (frames.len() * 4) as u32;
+    let mut b: Vec<u8> = Vec::with_capacity(44 + data_len as usize);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data_len).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&3u16.to_le_bytes());
+    b.extend_from_slice(&(ch as u16).to_le_bytes());
+    b.extend_from_slice(&fs.to_le_bytes());
+    b.extend_from_slice(&(fs * 4 * ch as u32).to_le_bytes());
+    b.extend_from_slice(&((4 * ch) as u16).to_le_bytes());
+    b.extend_from_slice(&32u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data_len.to_le_bytes());
+    for v in frames {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, b)?;
+    Ok(())
+}
+
+/// Play interleaved frames (several speakers' signals) on one node.
+pub fn play_frames(node: &str, fs: u32, channels: u16, frames: &[f32], tag: usize) -> Result<Child> {
+    let path = tmp(&format!("playm-{tag}.wav"));
+    write_wav_frames(&path, fs, channels, frames)?;
+    Command::new("pw-play")
+        .arg(format!("--target={node}"))
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting pw-play (install pipewire-bin / pipewire-utils?)")
+}
+
 /// Mono samples from a WAV file (float32 or int16; channels averaged).
 pub fn read_wav(path: &PathBuf) -> Result<(Vec<f32>, u32)> {
     let b = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;

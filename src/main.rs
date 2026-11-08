@@ -10,6 +10,11 @@ mod levels;
 mod map;
 mod pwio;
 mod render;
+mod session;
+mod settings;
+mod tracker;
+#[cfg(test)]
+mod acc_probe;
 mod tui;
 
 use anyhow::{bail, Context, Result};

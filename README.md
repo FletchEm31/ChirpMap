@@ -151,3 +151,30 @@ Calibration profiles are saved per real device pair, so each speaker keeps its o
 ```bash
 chirpmap calibrate --output "pw:<sink name from: pactl list short sinks>"
 ```
+
+## v0.9: fewer ghosts, several people, silent mode, faster frames, record & replay
+
+**Pairs have to agree.** Each speaker→mic pair still turns echoes into ellipses on the plan. Before, the array tracker added them all up, so a spot where only some ellipses happened to cross could light up as a "ghost". Now each pair is compared against its own noise level and the pairs are combined with a geometric mean: a spot only scores if *every* pair hears something there. The strongest spot is taken as a person, that person's echo is removed from every pair, and the picture is redrawn before looking for anyone else. Curves that only lit up because of the first person disappear with them.
+
+**Several people, each with an ID.** A tracker follows each person over time (position plus velocity). A new spot has to keep showing up near where it's predicted for about half a second before it's confirmed and given a number, so one-frame flickers never get an ID. Each person gets their own colour on the radar (#1 red, #2 orange, #3 magenta, #4 green), with a fading trail. Up to 4 people.
+
+**Speed of sound checks itself.** Sound travels about 0.6 m/s faster for every °C, which is roughly 1 cm of error per metre over a 10 °C swing. When the array starts it listens to the room, predicts where each wall echo should land from your Room designer layout, and picks the speed of sound that lines them up best. The header shows it, e.g. `speed of sound 345.5 m/s (≈ 24 °C, checked against your walls)`. If the walls aren't clear enough it says so and uses 343 m/s.
+
+**Silent mode** (menu `s`): moves the chirp up to 18–21 kHz, above most adults' hearing. Calibration now reports whether each speaker + mic pair reaches that band (`18–21 kHz (silent band): 14 dB SNR, good`). Kids and pets may still hear it. In silent mode the band is too narrow to split between speakers, so speakers take turns.
+
+**All speakers chirp at once.** Each speaker gets its own slice of the band, alternating upward and downward sweeps, so one recording separates all of them. With three speakers that's one ping per frame instead of three. Speakers on the same device (receiver L + R) are mixed into one multi-channel stream. If the slices would be narrower than 2.5 kHz, it falls back to taking turns.
+
+**Record and replay.** Press `v` in the Array tracker to start or stop recording (`● REC` in the corner). Sessions go to `~/chirpmap-sessions/` as JSON lines: room layout, speed of sound and settings, then every frame (heat map and tracks). Menu `9` plays them back. Space plays or pauses, ← → step one frame, PgUp/PgDn jump 30 frames, Home/End, `+`/`−` change speed, `[`/`]` switch between older and newer sessions.
+
+### Simulator results (the 3-speaker + 1-mic desk layout)
+
+| | median | 90th pct | within 15 cm | missed | ghosts per frame |
+|---|---|---|---|---|---|
+| v0.8 (sum + strongest spot) | 7 cm | 24 cm | 62% | 27% | 0.27 |
+| v0.9, 1 person | 6 cm | 24 cm | 81% | 0% | 0.00 |
+| v0.9, 1 person, all speakers at once | 7 cm | 12 cm | 90% | 3% | 0.25 |
+| v0.9, 2 people | 7 cm | 29 cm | 64% | 10% | 0.21 |
+| v0.9 + C920 as a 2nd mic, all at once, 1 person | 5 cm | 8 cm | 99% | 0% | 0.02 |
+| v0.9 + C920, all at once, 2 people | 7 cm | 18 cm | 87% | 1% | 0.34 |
+
+Simulator only: a perfect rectangle, first-order wall echoes, no furniture. Real rooms are worse. To rerun it: `cargo test --release acc_probe -- --ignored --nocapture`.

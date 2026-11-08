@@ -421,6 +421,55 @@ pub(crate) fn build_output(
     }
 }
 
+/// Play an already-interleaved buffer (`cfg.channels` samples per frame), so
+/// several speakers on one device can each get their own signal at once.
+pub(crate) fn build_output_frames(dev: &Device, cfg: &StreamConfig, fmt: SampleFormat, frames: Arc<Vec<f32>>, pos: Arc<AtomicUsize>) -> Result<Stream> {
+    fn mk<T>(dev: &Device, cfg: &StreamConfig, frames: Arc<Vec<f32>>, pos: Arc<AtomicUsize>) -> Result<Stream>
+    where
+        T: SizedSample + FromSample<f32>,
+    {
+        Ok(dev.build_output_stream(
+            cfg,
+            move |d: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let mut p = pos.load(Ordering::Relaxed);
+                for s in d.iter_mut() {
+                    *s = T::from_sample(frames.get(p).copied().unwrap_or(0.0));
+                    p += 1;
+                }
+                pos.store(p, Ordering::Relaxed);
+            },
+            err_fn,
+            None,
+        )?)
+    }
+    match fmt {
+        SampleFormat::F32 => mk::<f32>(dev, cfg, frames, pos),
+        SampleFormat::I16 => mk::<i16>(dev, cfg, frames, pos),
+        SampleFormat::U16 => mk::<u16>(dev, cfg, frames, pos),
+        SampleFormat::I32 => mk::<i32>(dev, cfg, frames, pos),
+        SampleFormat::U8 => mk::<u8>(dev, cfg, frames, pos),
+        f => bail!("unsupported speaker sample format {f:?}"),
+    }
+}
+
+/// Interleave per-speaker signals into one device's channels. Each entry is
+/// (channel or None = every channel, signal); overlapping signals add.
+pub fn interleave(channels: usize, parts: &[(Option<usize>, &[f32])]) -> Vec<f32> {
+    let ch = channels.max(1);
+    let n = parts.iter().map(|p| p.1.len()).max().unwrap_or(0);
+    let mut out = vec![0.0f32; n * ch];
+    for &(only, sig) in parts {
+        for (i, &v) in sig.iter().enumerate() {
+            for c in 0..ch {
+                if only.map_or(true, |o| o == c) {
+                    out[i * ch + c] += v;
+                }
+            }
+        }
+    }
+    out
+}
+
 impl Sonar for CpalSonar {
     fn fs(&self) -> u32 {
         self.fs

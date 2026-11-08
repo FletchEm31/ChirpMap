@@ -57,8 +57,10 @@ impl Profile {
         }
     }
 
+    /// The chirp to use (the silent 18–21 kHz band when silent mode is on).
     pub fn template(&self) -> Vec<f32> {
-        chirp(self.fs, self.chirp_s, self.f0, self.f1)
+        let (f0, f1) = crate::settings::band(self.fs, self.f0, self.f1);
+        chirp(self.fs, self.chirp_s, f0, f1)
     }
 }
 
@@ -171,15 +173,24 @@ pub fn run(sonar: &mut dyn Sonar, levels: Option<(&crate::levels::Session, u32)>
     // 2. Frequency response probe: wide chirp, compare to noise per 1 kHz band
     println!("{} Probing speaker/mic frequency response…", next());
     let top = (0.45 * fs as f32).min(20_000.0);
-    let probe = chirp(fs, 0.02, 1000.0, top);
+    let probe_top = (0.47 * fs as f32).min(21_000.0);
+    let probe = chirp(fs, 0.02, 1000.0, probe_top);
     let rec = sonar.playrec(&probe, listen, 0.6)?;
     let env = matched_envelope(&rec, &probe);
     let start = dsp::argmax(&env);
     let seg_len = probe.len() + m_to_samples(0.5, fs);
     let seg = &rec[start..(start + seg_len).min(rec.len())];
     let nseg = &noise[..seg.len().min(noise.len())];
-    p.band_snr = dsp::band_snr(seg, nseg, fs, 1000.0, top);
-    match dsp::pick_band(&p.band_snr, 10.0) {
+    p.band_snr = dsp::band_snr(seg, nseg, fs, 1000.0, probe_top);
+    // Silent mode needs the speaker and mic to reach 18 kHz and up.
+    let hi: Vec<f32> = p.band_snr.iter().filter(|b| b.0 >= crate::settings::SILENT_F0).map(|b| b.1).collect();
+    if !hi.is_empty() {
+        let worst = hi.iter().cloned().fold(f32::MAX, f32::min);
+        let verdict = if worst >= 10.0 { "good — silent mode will work" } else if worst >= 3.0 { "weak — silent mode will be noisy" } else { "too weak for silent mode on this pair" };
+        println!("      18–{:.0} kHz (silent band): {:.0} dB SNR, {verdict}", probe_top / 1000.0, worst);
+    }
+    let bands: Vec<(f32, f32)> = p.band_snr.iter().cloned().filter(|b| b.0 + 1000.0 <= top).collect();
+    match dsp::pick_band(&bands, 10.0) {
         Some((a, b)) => {
             p.f0 = a.max(1000.0);
             p.f1 = b.min(top);

@@ -7,6 +7,11 @@
 
 Terminal-native acoustic echolocation that maps rooms like blueprint - monitors changes, movement and activity, using any speaker and mic. Fully offline. Written in Rust.  Efficiency and accuracy results vary greatly depending on device microphone and speaker equality and ability along with room setup.  Future versions will allow multi speaker, microphone, and device setup and array.
 
+<p align="center">
+  <img src="docs/chirpmap-radar.gif" alt="ChirpMap array tracker: red radar pings following a person across a blueprint of the room" width="600"><br>
+  <sub>Live array tracker: a soundbar + two Klipsch towers + one USB mic. Every red ping is a detected movement placed on the room's blueprint.</sub>
+</p>
+
 ChirpMap plays a short frequency sweep (a *chirp*) through your speaker, records the mic at the same time, and matched-filters the recording to find echoes. Rotate the device through a few headings and it builds a floor plan in your terminal, plus an SVG blueprint with dimensions and a title block.
 
 ---

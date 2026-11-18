@@ -18,8 +18,8 @@ Owner: Fletch (GitHub `FletchEm31`).
 ## Tasks and handoffs live in the Obsidian vault
 Tasks, session handoffs and planning notes live in the owner's Obsidian vault on the desktop,
 `~/Obsidian/BlackholeNetwork-Notes`, not in this repo:
-- Before starting: read the vault's `CLAUDE.md`, then `Projects/ChirpMap/Tasks.md` and the newest note in
-  `Projects/ChirpMap/Handoffs/`.
+- Before starting: read the vault's `CLAUDE.md`, then `Projects/Repos/ChirpMap/Tasks.md` and the newest note in
+  `Projects/Repos/ChirpMap/Handoffs/`.
 - At the end: update that `Tasks.md` and write a handoff there (format in the vault's `CLAUDE.md`). Don't add
   session records or to-do lists to this repo.
 - From a cloud session, reach the vault through the desktop bridge. No vault access: end the reply with the Tasks
